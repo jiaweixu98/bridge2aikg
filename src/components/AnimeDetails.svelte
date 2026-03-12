@@ -110,7 +110,7 @@
     import.meta.env.PUBLIC_MATRIX_APP_URL || resolveLocalDevBase('http://127.0.0.1:3000', '/matrix')
   ).replace(/\/$/, '');
   const matrixApiBaseUrl = (
-    import.meta.env.PUBLIC_MATRIX_API_URL || resolveLocalDevBase('http://127.0.0.1:8001/api', '/matrix/api')
+    import.meta.env.PUBLIC_MATRIX_API_URL || resolveLocalDevBase('http://127.0.0.1:8000/api', '/matrix/api')
   ).replace(/\/$/, '');
 
   const openMatrixRecommendation = async (authorId: number) => {

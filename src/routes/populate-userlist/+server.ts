@@ -4,6 +4,8 @@ import { error, text, type RequestHandler } from '@sveltejs/kit';
 import { ADMIN_API_TOKEN } from '../../conf';
 // import { DbPool } from '../../dbUtil';
 
+const USERNAMES_JSON_PATH = (process.env.USERNAMES_JSON_PATH || 'work/data/all_usernames.json').trim();
+
 export const GET: RequestHandler = async ({ url }) => {
   const token = url.searchParams.get('token');
   if (!token) {
@@ -15,7 +17,7 @@ export const GET: RequestHandler = async ({ url }) => {
   }
 
   try {
-    const usernamesJSON = fs.readFileSync('/home/casey/mal-graph/data/all_usernames.json', {
+    const usernamesJSON = fs.readFileSync(USERNAMES_JSON_PATH, {
       encoding: 'utf-8',
     });
     const allUsernames = JSON.parse(usernamesJSON);

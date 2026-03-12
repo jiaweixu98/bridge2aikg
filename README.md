@@ -74,51 +74,56 @@ Notes:
 
 ## Correct Pipeline Integration (local)
 
-Data source pipeline:
+Data source pipeline (example):
 
-- `/data/jiawei_data/correct_pipline_code`
-- `/data/jiawei_data/correct_bridge2aikg_full_web`
+- `PIPELINE_ROOT=/home/ubuntu/correct_pipline_code`
+- `DATA_ROOT=/home/ubuntu`
 
-Runtime data path for this app:
+```bash
+export PIPELINE_ROOT=/home/ubuntu/correct_pipline_code
+export DATA_ROOT=/home/ubuntu
+```
 
-- `/data/jiawei_data/bridge2aikg/work/data`
+Runtime data path for this app (example):
+
+- `$DATA_ROOT/bridge2aikg/work/data`
 
 Sync command:
 
 ```bash
-python /data/jiawei_data/correct_pipline_code/08_sync_to_apps.py
+python "$PIPELINE_ROOT/08_sync_to_apps.py"
 ```
 
 Gate check:
 
 ```bash
-python /data/jiawei_data/correct_pipline_code/09_smoke_test_apps.py
+python "$PIPELINE_ROOT/09_smoke_test_apps.py"
 ```
 
 Canonical release path:
 
-1. `python /data/jiawei_data/correct_pipline_code/run_pipeline.py --embedding-model specter2 --layout-method umap`
-2. `python /data/jiawei_data/correct_pipline_code/08_sync_to_apps.py`
-3. `python /data/jiawei_data/correct_pipline_code/09_smoke_test_apps.py`
+1. `python "$PIPELINE_ROOT/run_pipeline.py" --embedding-model specter2 --layout-method umap`
+2. `python "$PIPELINE_ROOT/08_sync_to_apps.py"`
+3. `python "$PIPELINE_ROOT/09_smoke_test_apps.py"`
 
 Fast rebuild path used on this host:
 
-1. `python /data/jiawei_data/correct_pipline_code/05_build_embeddings.py --embedding-model specter2 --author-agg-mode paper_weighted --devices cuda:1,cuda:2,cuda:3 --batch-size 32 --max-papers-per-author 12 --layout-method umap`
-2. `python /data/jiawei_data/correct_pipline_code/06_export_bridge2aikg.py`
-3. `python /data/jiawei_data/correct_pipline_code/07_export_cm4ai_bot.py`
-4. `python /data/jiawei_data/correct_pipline_code/08_sync_to_apps.py`
-5. `python /data/jiawei_data/correct_pipline_code/09_smoke_test_apps.py`
+1. `python "$PIPELINE_ROOT/05_build_embeddings.py" --embedding-model specter2 --author-agg-mode paper_weighted --devices cuda:1,cuda:2,cuda:3 --batch-size 32 --max-papers-per-author 12 --layout-method umap`
+2. `python "$PIPELINE_ROOT/06_export_bridge2aikg.py"`
+3. `python "$PIPELINE_ROOT/07_export_cm4ai_bot.py"`
+4. `python "$PIPELINE_ROOT/08_sync_to_apps.py"`
+5. `python "$PIPELINE_ROOT/09_smoke_test_apps.py"`
 
 Snapshot rollback:
 
 ```bash
-python /data/jiawei_data/correct_pipline_code/08_sync_to_apps.py --snapshot-id <snapshot_id> --no-snapshot
+python "$PIPELINE_ROOT/08_sync_to_apps.py" --snapshot-id <snapshot_id> --no-snapshot
 ```
 
 Paper embedding cache note:
 
 - Step 05 in pipeline reuses cached paper embedding shards under  
-  `/data/jiawei_data/correct_bridge2aikg_full_web/intermediate/paper_embeddings_cache/`  
+  `$DATA_ROOT/correct_bridge2aikg_full_web/intermediate/paper_embeddings_cache/`  
   when PMID lists match.
 
 ## Git / Repo Notes

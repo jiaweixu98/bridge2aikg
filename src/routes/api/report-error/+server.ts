@@ -2,7 +2,8 @@ import { json, type RequestHandler } from '@sveltejs/kit';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
-const REPORT_OUTPUT_DIR = '/data/jiawei_data/bridge2aikg/work/data';
+const REPORT_OUTPUT_DIR =
+  (process.env.REPORT_OUTPUT_DIR || '').trim() || '/home/ubuntu/bridge2aikg/work/data';
 
 type ReportErrorPayload = {
   project?: string;

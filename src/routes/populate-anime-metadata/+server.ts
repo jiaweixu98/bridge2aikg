@@ -5,9 +5,11 @@ import { error, text, type RequestHandler } from '@sveltejs/kit';
 import { ADMIN_API_TOKEN } from '../../conf';
 import { getAnimesByID, MALAPIError } from '../../malAPI';
 
+const ALL_ANIME_IDS_PATH = (process.env.ALL_ANIME_IDS_PATH || 'work/data/all-anime-ids.json').trim();
+
 const fillFromScratch = async () => {
   const allAnimeIDs: number[] = await new Promise((resolve) =>
-    fs.readFile('/home/casey/anime-atlas/data/all-anime-ids.json', 'utf8', (err, data) => resolve(JSON.parse(data)))
+    fs.readFile(ALL_ANIME_IDS_PATH, 'utf8', (err, data) => resolve(JSON.parse(data)))
   );
 
   await new Promise((resolve, reject) => {
