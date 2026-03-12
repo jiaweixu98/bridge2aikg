@@ -146,12 +146,14 @@ export const GET: RequestHandler = async ({ url, setHeaders, fetch }) => {
     console.log('[DEBUG] API /api/data - Paginated neighbors length:', paginatedNeighbors.length);
     
     // Set cache headers to cache the response for better performance on subsequent loads
+    const cacheControl = process.env.NODE_ENV === 'development' ? 'no-store' : 'public, max-age=3600';
     setHeaders({
-      'Cache-Control': 'public, max-age=3600', // Cache for 1 hour
+      'Cache-Control': cacheControl,
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET',
       'Access-Control-Allow-Headers': 'Content-Type',
+      ...(approxBytes !== null ? { 'X-Approx-Bytes': String(approxBytes * 1024 * 1024) } : {}),
     });
     
     console.log('[DEBUG] API /api/data - Creating response object');
@@ -211,10 +213,11 @@ export const GET: RequestHandler = async ({ url, setHeaders, fetch }) => {
       return new Response(stream, {
         status: 200,
         headers: {
-          'Cache-Control': 'no-cache',
+          'Cache-Control': process.env.NODE_ENV === 'development' ? 'no-store' : 'no-cache',
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET',
+          ...(approxBytes !== null ? { 'X-Approx-Bytes': String(approxBytes * 1024 * 1024) } : {}),
         },
       });
     }

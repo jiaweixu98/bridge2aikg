@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import { parse } from 'csv-parse';
 import path from 'path';
 import { DATA_DIR, DATA_HTTP_BASE, buildDataUrl } from './conf';
 import { Readable } from 'stream';
@@ -18,6 +17,7 @@ export interface Metadatum {
   id: number;
   FullName: string;
   BeginYear: number;
+  RecentYear?: number;
   PaperNum: number;
   IsAuthor: boolean;
   color_category: number;
@@ -37,8 +37,8 @@ const CachedEmbeddings: Map<EmbeddingName, { data: Embedding; timestamp: number 
 const CachedNeighbors: Map<EmbeddingName, { data: number[][]; timestamp: number }> = new Map();
 let CachedMetadata: { data: Map<number, Metadatum>; timestamp: number } | null = null;
 
-// Cache TTL: 1 hour
-const CACHE_TTL = 60 * 60 * 1000;
+// Cache TTL: disable in dev so layout file switches are visible immediately.
+const CACHE_TTL = process.env.NODE_ENV === 'development' ? 0 : 60 * 60 * 1000;
 
 const isCacheValid = (timestamp: number): boolean => {
   return Date.now() - timestamp < CACHE_TTL;
@@ -54,6 +54,51 @@ const resolvePathBase = (): string => {
   const base = DATA_HTTP_BASE.replace(/\/$/, '');
   if (/^https?:\/\//i.test(base)) return base;
   return base.startsWith('/') ? base : `/${base}`;
+};
+
+const toNum = (v: unknown, fallback = 0): number => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+const toText = (v: unknown): string => {
+  const s = String(v ?? '').trim();
+  if (!s) return '';
+  const lowered = s.toLowerCase();
+  if (lowered === 'nan' || lowered === 'none' || lowered === 'null') return '';
+  return s;
+};
+
+const toBool = (v: unknown, fallback = true): boolean => {
+  if (typeof v === 'boolean') return v;
+  const s = String(v ?? '').trim().toLowerCase();
+  if (s === '1' || s === 'true' || s === 'yes') return true;
+  if (s === '0' || s === 'false' || s === 'no') return false;
+  return fallback;
+};
+
+const normalizeMetadatum = (row: any): Metadatum | null => {
+  const id = toNum(row?.id, NaN);
+  if (!Number.isFinite(id)) return null;
+
+  if (row?.Affiliation === undefined || row?.is_author === undefined) {
+    throw new Error(`Invalid canonical metadata row for id=${row?.id ?? 'unknown'}: missing Affiliation/is_author`);
+  }
+
+  return {
+    id,
+    FullName: toText(row?.FullName) || 'Unknown',
+    BeginYear: toNum(row?.BeginYear, 0),
+    RecentYear: toNum(row?.RecentYear, 0),
+    PaperNum: toNum(row?.PaperNum, 0),
+    IsAuthor: toBool(row?.is_author, true),
+    color_category: toNum(row?.color_category, 0),
+    Affiliation: toText(row?.Affiliation),
+    Data_Source: toText(row?.Data_Source),
+    Data_Description: toText(row?.Data_Description),
+    Data_url: toText(row?.Data_url),
+    Representative_papers: toText(row?.pmids_string),
+  };
 };
 
 const readTextFromFsOrHttp = async (relativeFilename: string, fetchFn?: FetchLike): Promise<string> => {
@@ -230,8 +275,8 @@ export const loadCollaborators = async (fetchFn?: FetchLike): Promise<Collaborat
 };
 
 
-// HEADERS: 
-const METADATA_FILE_NAME = path.resolve(DATA_DIR, 'author_dataset_added_citations.csv');
+// Canonical metadata only.
+const METADATA_JSON_FILE_NAME = path.resolve(DATA_DIR, 'author_metadata.json');
 
 // id: number;ver
 // FullName: string;
@@ -246,93 +291,40 @@ export const loadMetadata = async (fetchFn?: FetchLike) => {
     return { metadataById: CachedMetadata.data };
   }
 
-  console.log(`[DEBUG] loadMetadata - Reading file: ${METADATA_FILE_NAME}`);
+  console.log(`[DEBUG] loadMetadata - Reading canonical metadata JSON first: ${METADATA_JSON_FILE_NAME}`);
   console.time('[timing] loadMetadata total');
   const metadataById = new Map<number, Metadatum>();
-  const httpAbsoluteUrl = buildDataUrl('author_dataset_added_citations.csv');
-  const httpRelativeUrl = `${resolvePathBase()}/author_dataset_added_citations.csv`;
-  try {
-    if (fs.existsSync(METADATA_FILE_NAME)) {
-      await new Promise((resolve) =>
-        fs
-          .createReadStream(METADATA_FILE_NAME)
-          .on('open', () => {
-            console.log('[DEBUG] loadMetadata - File opened successfully');
-            console.time('[timing] loadMetadata stream');
-          })
-          .on('close', () => {
-            console.timeEnd('[timing] loadMetadata stream');
-            resolve(undefined);
-          })
-          .pipe(parse({ delimiter: ',', columns: true }))
-          .on('data', (row) => {
-            const id = +row['id'];
-            if (Number.isNaN(id)) return;
-            const metadatum: Metadatum = {
-              id,
-              FullName: row['FullName'],
-              BeginYear: +row['BeginYear'],
-              PaperNum: +row['PaperNum'],
-              IsAuthor: row['is_author'] === '1',
-              color_category: +row['color_category'],
-              Affiliation: row['Affiliation'],
-              Data_Source: row['Data_Source'],
-              Data_Description: row['Data_Description'],
-              Data_url: row['Data_url'],
-              Representative_papers: row['pmids_string'],
-            };
-            metadataById.set(id, metadatum);
-          })
-          .on('end', () => {
-            console.timeEnd('[timing] loadMetadata total');
-            CachedMetadata = { data: metadataById, timestamp: Date.now() };
-            resolve(metadataById);
-          })
-      );
-    } else {
-      throw new Error('CSV not found on filesystem');
-    }
-  } catch (e) {
-    const url = fetchFn ? httpRelativeUrl : httpAbsoluteUrl;
-    console.warn(`[WARN] loadMetadata - FS stream failed, falling back to HTTP: ${url}`);
+  const jsonHttpAbsoluteUrl = buildDataUrl('author_metadata.json');
+  const jsonHttpRelativeUrl = `${resolvePathBase()}/author_metadata.json`;
+
+  const setCacheAndReturn = () => {
+    console.timeEnd('[timing] loadMetadata total');
+    CachedMetadata = { data: metadataById, timestamp: Date.now() };
+    return { metadataById };
+  };
+
+  let rows: any[] = [];
+  if (fs.existsSync(METADATA_JSON_FILE_NAME)) {
+    const text = await fs.promises.readFile(METADATA_JSON_FILE_NAME, 'utf8');
+    rows = JSON.parse(text);
+  } else {
+    const url = fetchFn ? jsonHttpRelativeUrl : jsonHttpAbsoluteUrl;
     const res = await (fetchFn ? fetchFn(url) : fetch(url));
-    if (!res.ok) throw new Error(`Failed to fetch CSV ${url}: ${res.status} ${res.statusText}`);
-    const csvText = await res.text();
-    // Parse CSV from string
-    await new Promise<void>((resolve, reject) => {
-      const parser = parse({ delimiter: ',', columns: true });
-      parser.on('readable', () => {
-        let row;
-        while ((row = parser.read()) !== null) {
-          const id = +row['id'];
-          if (Number.isNaN(id)) continue;
-          const metadatum: Metadatum = {
-            id,
-            FullName: row['FullName'],
-            BeginYear: +row['BeginYear'],
-            PaperNum: +row['PaperNum'],
-            IsAuthor: row['is_author'] === '1',
-            color_category: +row['color_category'],
-            Affiliation: row['Affiliation'],
-            Data_Source: row['Data_Source'],
-            Data_Description: row['Data_Description'],
-            Data_url: row['Data_url'],
-            Representative_papers: row['pmids_string'],
-          };
-          metadataById.set(id, metadatum);
-        }
-      });
-      parser.on('error', reject);
-      parser.on('end', () => {
-        console.timeEnd('[timing] loadMetadata total');
-        CachedMetadata = { data: metadataById, timestamp: Date.now() };
-        resolve();
-      });
-      parser.write(csvText);
-      parser.end();
-    });
+    if (!res.ok) throw new Error(`Failed to fetch metadata JSON ${url}: ${res.status} ${res.statusText}`);
+    rows = JSON.parse(await res.text());
   }
-  return { metadataById };
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error('Canonical metadata JSON is empty or invalid');
+  }
+  for (const row of rows) {
+    const metadatum = normalizeMetadatum(row);
+    if (!metadatum) continue;
+    metadataById.set(metadatum.id, metadatum);
+  }
+  if (metadataById.size === 0) {
+    throw new Error('Canonical metadata JSON contains no valid rows');
+  }
+  return setCacheAndReturn();
 };
 
 const AllValidEmbeddingNames = new Set<EmbeddingName>([
@@ -418,20 +410,6 @@ const loadRawEmbedding = async (embeddingName: EmbeddingName, fetchFn?: FetchLik
   }
 };
 
-const buildDummyMetadatum = (id: number): Metadatum => ({
-  id,
-  FullName: 'Unknown',
-  BeginYear: 0,
-  PaperNum: 0,
-  IsAuthor: false, // ensure `IsAuthor` exist
-  color_category: 0, // set up default value
-  Affiliation: 'Unknown', // set up default as 'Unknown'
-  Data_Source: 'N/A', // avoid undefined error msg
-  Data_Description: 'No data available',
-  Data_url: '',
-  Representative_papers: '',
-});
-
 export const loadEmbedding = async (embeddingName: EmbeddingName, fetchFn?: FetchLike): Promise<Embedding> => {
   console.log(`[DEBUG] loadEmbedding - Starting for ${embeddingName}`);
   console.time(`[timing] loadEmbedding total (${embeddingName})`);
@@ -458,31 +436,26 @@ export const loadEmbedding = async (embeddingName: EmbeddingName, fetchFn?: Fetc
 
   const embedding: Embedding = [];
   console.time(`[timing] loadEmbedding build (${embeddingName})`);
+  let skippedMissingMetadata = 0;
   for (const [index, point] of entries) {
     const i = +index;
     const id = +rawEmbedding.ids[i];
-    let metadatum = metadataById.get(id) // ensure recieve msg from metadataById
+    const metadatum = metadataById.get(id); // ensure receive msg from metadataById
     if (!metadatum) {
-      console.warn(`Missing metadata for ID ${id}, creating placeholder.`);
-      metadatum = {
-        id,
-        FullName: 'Unknown',
-        BeginYear: 0,
-        PaperNum: 0,
-        IsAuthor: false,
-        color_category: 0,
-        Affiliation: 'Unknown',
-        Data_Source: 'N/A',
-        Data_Description: 'No data available',
-        Data_url: '',
-        Representative_papers: '',
-      }; // Implement Bioentity
+      skippedMissingMetadata++;
+      continue;
     }
 
     embedding.push({
       vector: { x: point.x * 5, y: point.y * 5 },
-      metadata: metadatum!,
+      metadata: metadatum,
     });
+  }
+  if (skippedMissingMetadata > 0) {
+    console.warn(
+      `[WARN] loadEmbedding - skipped ${skippedMissingMetadata} points without canonical metadata ` +
+        `(embedding=${embeddingName})`
+    );
   }
   console.timeEnd(`[timing] loadEmbedding build (${embeddingName})`);
   // did not work?
@@ -530,7 +503,10 @@ export const loadNeighbors = async (embeddingName: EmbeddingName, fetchFn?: Fetc
 
   // Build a sorted list of IDs matching the embedding sort order
   console.time(`[timing] loadNeighbors sort IDs (${embeddingName})`);
-  const sortedIds = Array.from(idByOriginalIndex).map(id => +id).sort((a, b) => {
+  const sortedIds = Array.from(idByOriginalIndex)
+    .map((id) => +id)
+    .filter((id) => metadataById.has(id))
+    .sort((a, b) => {
     const metaA = metadataById.get(a);
     const metaB = metadataById.get(b);
     if (!metaA || !metaB) return 0;
@@ -538,7 +514,7 @@ export const loadNeighbors = async (embeddingName: EmbeddingName, fetchFn?: Fetc
       return metaB.PaperNum - metaA.PaperNum;
     }
     return metaB.id - metaA.id;
-  });
+    });
   console.timeEnd(`[timing] loadNeighbors sort IDs (${embeddingName})`);
 
   console.time(`[timing] loadNeighbors map neighbors (${embeddingName})`);
@@ -553,7 +529,9 @@ export const loadNeighbors = async (embeddingName: EmbeddingName, fetchFn?: Fetc
       return [];
     }
 
-    return neighborIndices.map((neighborIndex) => +idByOriginalIndex[neighborIndex]);
+    return neighborIndices
+      .map((neighborIndex) => +idByOriginalIndex[neighborIndex])
+      .filter((neighborId) => metadataById.has(neighborId));
   });
   console.timeEnd(`[timing] loadNeighbors map neighbors (${embeddingName})`);
 

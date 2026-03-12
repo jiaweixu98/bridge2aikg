@@ -4,7 +4,7 @@ Interactive talent knowledge graph for Bridge2AI, integrated with the CM4AI reco
 
 ## What This Project Does
 
-- Visualizes a large author graph (about 89k nodes) in an interactive canvas.
+- Visualizes a large author graph (typically tens of thousands of nodes; size depends on current seed build) in an interactive canvas.
 - Supports search, highlighting collaborators, and author detail exploration.
 - Links into the teammate recommendation app (`cm4ai-bot`) with `aid` handoff.
 - Uses staged loading (small first payload, then background sync) for faster first interaction.
@@ -63,13 +63,63 @@ Expected local data path:
 Main files used at runtime:
 
 - `work/data/tkg_ebd_89k_dataset.json`
-- `work/data/author_dataset_added_citations.csv`
-- (optional for static fallback) `static/data/*`
+- `work/data/author_metadata.json`
+- `work/data/author_collab_dataset.json`
+- `work/data/layout_manifest.json`
 
 Notes:
 
 - Large data files are intentionally ignored in git.
 - APIs load collaborators on-demand to reduce initial payload.
+
+## Correct Pipeline Integration (local)
+
+Data source pipeline:
+
+- `/data/jiawei_data/correct_pipline_code`
+- `/data/jiawei_data/correct_bridge2aikg_full_web`
+
+Runtime data path for this app:
+
+- `/data/jiawei_data/bridge2aikg/work/data`
+
+Sync command:
+
+```bash
+python /data/jiawei_data/correct_pipline_code/08_sync_to_apps.py
+```
+
+Gate check:
+
+```bash
+python /data/jiawei_data/correct_pipline_code/09_smoke_test_apps.py
+```
+
+Canonical release path:
+
+1. `python /data/jiawei_data/correct_pipline_code/run_pipeline.py --embedding-model specter2 --layout-method umap`
+2. `python /data/jiawei_data/correct_pipline_code/08_sync_to_apps.py`
+3. `python /data/jiawei_data/correct_pipline_code/09_smoke_test_apps.py`
+
+Fast rebuild path used on this host:
+
+1. `python /data/jiawei_data/correct_pipline_code/05_build_embeddings.py --embedding-model specter2 --author-agg-mode paper_weighted --devices cuda:1,cuda:2,cuda:3 --batch-size 32 --max-papers-per-author 12 --layout-method umap`
+2. `python /data/jiawei_data/correct_pipline_code/06_export_bridge2aikg.py`
+3. `python /data/jiawei_data/correct_pipline_code/07_export_cm4ai_bot.py`
+4. `python /data/jiawei_data/correct_pipline_code/08_sync_to_apps.py`
+5. `python /data/jiawei_data/correct_pipline_code/09_smoke_test_apps.py`
+
+Snapshot rollback:
+
+```bash
+python /data/jiawei_data/correct_pipline_code/08_sync_to_apps.py --snapshot-id <snapshot_id> --no-snapshot
+```
+
+Paper embedding cache note:
+
+- Step 05 in pipeline reuses cached paper embedding shards under  
+  `/data/jiawei_data/correct_bridge2aikg_full_web/intermediate/paper_embeddings_cache/`  
+  when PMID lists match.
 
 ## Git / Repo Notes
 

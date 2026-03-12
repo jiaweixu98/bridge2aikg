@@ -3,9 +3,15 @@
 
   // export let embedding: { metadata: { id: number; title: string; title_english: string } }[];
   export let embedding: {
-    metadata: { id: number; FullName: string; Data_Description: string; Category: string; Institution: string };
+    metadata: {
+      id: number;
+      FullName: string;
+      Data_Description: string;
+      Category?: string;
+      Affiliation?: string;
+    };
   }[];
-  export let onSubmit: (id: number, FullName: string, Category?: string, Institution?: string) => void;
+  export let onSubmit: (id: number, FullName: string, Category?: string, Affiliation?: string) => void;
   export let style: string | undefined = undefined;
   export let inputStyle: string | undefined = undefined;
   export let suggestionsStyle: string | undefined = undefined;
@@ -25,6 +31,10 @@
   const handleInputChange = (evt: any) => {
     value = evt.target.value;
   };
+
+  const getAffiliationText = (metadata: {
+    Affiliation?: string;
+  }) => metadata.Affiliation ?? '';
 
   // Add safeText utility
   const safeText = (text: string | undefined | null) => (text ?? '').replace(/[^\x20-\x7E\u4e00-\u9fa5]/g, '').trim();
@@ -58,20 +68,20 @@
               suggestion.item.metadata.id,
               suggestion.item.metadata.FullName,
               suggestion.item.metadata.Category, // passing category
-              suggestion.item.metadata.Institution // passing institution
+              getAffiliationText(suggestion.item.metadata)
             );
             value = suggestion.item.metadata.FullName;
           }}
         >
           <strong>{suggestion.item.metadata.FullName}</strong>
-          {#if suggestion.item.metadata.Category || suggestion.item.metadata.Institution}
+          {#if suggestion.item.metadata.Category || getAffiliationText(suggestion.item.metadata)}
             <small
               >(
               {safeText(suggestion.item.metadata.Category)}
-              {#if suggestion.item.metadata.Category && suggestion.item.metadata.Institution}
+              {#if suggestion.item.metadata.Category && getAffiliationText(suggestion.item.metadata)}
                 -
               {/if}
-              {safeText(suggestion.item.metadata.Institution)}
+              {safeText(getAffiliationText(suggestion.item.metadata))}
               )</small
             >
           {/if}
@@ -107,22 +117,30 @@
   }
 
   label {
-    font-size: 12px;
+    font-size: 15px;
     color: #334155;
-    font-weight: 600;
+    font-weight: 700;
     letter-spacing: 0.02em;
   }
 
   input {
-    font-size: 14px;
-    padding: 8px 10px;
+    font-size: 17px;
+    font-weight: 700;
+    padding: 10px 12px;
     box-sizing: border-box;
     width: 100%;
-    min-height: 38px;
+    min-height: 44px;
     border-radius: 8px;
     border: 1px solid rgba(15, 23, 42, 0.16);
     background: rgba(255, 255, 255, 0.98);
     color: #0f172a;
+  }
+
+  input::placeholder {
+    font-size: 16px;
+    font-weight: 700;
+    color: #475569;
+    opacity: 1;
   }
 
   .suggestions-container {

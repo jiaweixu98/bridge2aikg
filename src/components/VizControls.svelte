@@ -220,22 +220,30 @@
   }
 
   label {
-    font-size: 12px;
+    font-size: 15px;
     margin-bottom: 2px;
     color: #334155;
-    font-weight: 600;
+    font-weight: 700;
   }
 
   input {
-    font-size: 14px;
-    padding: 8px 10px;
+    font-size: 17px;
+    font-weight: 700;
+    padding: 10px 12px;
     box-sizing: border-box;
     width: 100%;
-    min-height: 38px;
+    min-height: 44px;
     border-radius: 8px;
     border: 1px solid rgba(15, 23, 42, 0.16);
     background: rgba(255, 255, 255, 0.98);
     color: #0f172a;
+  }
+
+  input::placeholder {
+    font-size: 16px;
+    font-weight: 700;
+    color: #475569;
+    opacity: 1;
   }
 
   .suggestions-container {

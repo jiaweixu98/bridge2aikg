@@ -54,9 +54,9 @@ export const GET: RequestHandler = async ({ url, setHeaders }) => {
       Math.round((JSON.stringify(lightweightEmbedding).length + JSON.stringify(lightweightNeighbors).length) / 1024);
     console.log('[timing] API /api/data/lightweight payload:', payloadSizes, `~${approxBytes} KB json (balanced sample)`);
     
-    // Set cache headers
+    // Disable cache in development to make layout swaps visible immediately.
     setHeaders({
-      'Cache-Control': 'public, max-age=3600', // Cache for 1 hour
+      'Cache-Control': process.env.NODE_ENV === 'development' ? 'no-store' : 'public, max-age=3600',
     });
     
     return json({ 

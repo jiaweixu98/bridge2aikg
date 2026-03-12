@@ -8,6 +8,17 @@ html {
   padding: 0;
   background-color: #060606 !important;
   box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  overflow: hidden !important;
+  overscroll-behavior: none;
+}
+
+/* Keep both axes scrollbar-free on the main KG visualization app */
+body::-webkit-scrollbar,
+html::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 /* * {

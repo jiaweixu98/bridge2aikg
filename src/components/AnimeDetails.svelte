@@ -11,17 +11,112 @@
   export let datum: EmbeddedPointWithIndex;
   export let embedding: Embedding;
   export let embeddingNeighbors;
-  export let viz: { flyTo: (id: number) => void };
+  export let viz: { flyTo: (id: number, opts?: { maxZoom?: boolean }) => void };
   export let collaboratorsdict;
-  const matrixAppBaseUrl = (import.meta.env.PUBLIC_MATRIX_APP_URL || '/matrix').replace(
-    /\/$/,
-    ''
-  );
+  export let onClose: () => void = () => {};
+  export let onOpenMatrixModal: ((url: string, title?: string) => void) | null = null;
+  const SHOW_PRECOMPUTED_COLLABS = false;
+  const normalizeAffText = (v: unknown) => String(v ?? '').trim();
+  const isMissingAff = (v: string) => {
+    const s = v.toLowerCase();
+    return !s || s === 'unknown' || s === 'none' || s === 'null' || s === 'nan' || s === 'n/a';
+  };
+  const resolveAffiliation = (meta: any) => {
+    const direct = normalizeAffText(meta?.Affiliation);
+    if (!isMissingAff(direct)) return direct;
+
+    // Canonical metadata should already be complete. Keep one lookup fallback for stale selected object.
+    const byId = embeddedPointByID.get(Number(meta?.id))?.metadata;
+    const fromLookup = normalizeAffText(byId?.Affiliation);
+    if (!isMissingAff(fromLookup)) return fromLookup;
+
+    return 'Unknown';
+  };
+  const parsePmidsCount = (pmids: unknown) => {
+    const raw = String(pmids ?? '').trim();
+    if (!raw) return 0;
+    return raw
+      .split(',')
+      .map((x) => x.trim())
+      .filter(Boolean).length;
+  };
+  const getRecentYear = () => {
+    const n = Number((datum?.metadata as any)?.RecentYear);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  let selectedPaperTitles: Array<{ title: string; year?: number; citationCount?: number }> = [];
+  let loadingPaperTitles = false;
+  let paperTitlesLoadedForAid: number | null = null;
+
+  const pickDisplayPapers = (papers: Array<{ title?: string; year?: number; citation_count?: number }>) => {
+    const cleaned = papers
+      .filter((p) => p && p.title && String(p.title).trim().length > 0)
+      .map((p) => ({
+        title: String(p.title).trim(),
+        year: Number(p.year) || 0,
+        citationCount: Number(p.citation_count) || 0,
+      }));
+
+    // Prefer papers that are not too old and not low-citation.
+    const tier1 = cleaned
+      .filter((p) => p.year >= 2012 && p.citationCount >= 10)
+      .sort((a, b) => (b.citationCount - a.citationCount) || (b.year - a.year));
+    if (tier1.length >= 2) return tier1.slice(0, 3);
+
+    const tier2 = cleaned
+      .filter((p) => p.year >= 2008 && p.citationCount >= 3)
+      .sort((a, b) => (b.citationCount - a.citationCount) || (b.year - a.year));
+    if (tier2.length >= 2) return tier2.slice(0, 3);
+
+    return cleaned.sort((a, b) => (b.citationCount - a.citationCount) || (b.year - a.year)).slice(0, 3);
+  };
+
+  const loadPaperTitlesForAuthor = async (authorId: number) => {
+    if (paperTitlesLoadedForAid === authorId) return;
+    paperTitlesLoadedForAid = authorId;
+    selectedPaperTitles = [];
+    loadingPaperTitles = true;
+    try {
+      const author = embeddedPointByID.get(authorId)?.metadata;
+      const pmids = String(author?.Representative_papers ?? '').trim();
+      if (!pmids) {
+        selectedPaperTitles = [];
+        return;
+      }
+      const pubData = await fetchPubData(pmids);
+      selectedPaperTitles = pickDisplayPapers(pubData?.data || []);
+    } catch (e) {
+      console.error('Failed to load display papers:', e);
+      selectedPaperTitles = [];
+    } finally {
+      loadingPaperTitles = false;
+    }
+  };
+
+  $: if (datum?.metadata?.IsAuthor && Number.isFinite(Number(datum.metadata.id))) {
+    void loadPaperTitlesForAuthor(Number(datum.metadata.id));
+  }
+  const resolveLocalDevBase = (localUrl: string, productionPath: string) => {
+    if (typeof window !== 'undefined') {
+      const host = window.location.hostname;
+      if (host === 'localhost' || host === '127.0.0.1') {
+        return localUrl;
+      }
+    }
+    return productionPath;
+  };
+
+  const matrixAppBaseUrl = (
+    import.meta.env.PUBLIC_MATRIX_APP_URL || resolveLocalDevBase('http://127.0.0.1:3000', '/matrix')
+  ).replace(/\/$/, '');
+  const matrixApiBaseUrl = (
+    import.meta.env.PUBLIC_MATRIX_API_URL || resolveLocalDevBase('http://127.0.0.1:8001/api', '/matrix/api')
+  ).replace(/\/$/, '');
 
   const openMatrixRecommendation = async (authorId: number) => {
     const aid = String(authorId);
     try {
-      const probeRes = await fetch(`/matrix/api/author/${encodeURIComponent(aid)}`, {
+      const probeRes = await fetch(`${matrixApiBaseUrl}/author/${encodeURIComponent(aid)}`, {
         method: 'GET',
       });
       if (!probeRes.ok) {
@@ -34,7 +129,13 @@
         aid,
         return_to: window.location.href,
       });
-      window.location.assign(`${matrixAppBaseUrl}/?${params.toString()}`);
+      const targetUrl = `${matrixAppBaseUrl}/?${params.toString()}`;
+      if (onOpenMatrixModal) {
+        const authorName = String(datum?.metadata?.FullName || `Author ${aid}`);
+        onOpenMatrixModal(targetUrl, `MATRIX for ${authorName}`);
+      } else {
+        window.location.assign(targetUrl);
+      }
     } catch (err) {
       console.error('Failed to validate MATRIX aid:', err);
       window.alert('Unable to reach the MATRIX service right now. Please try again later.');
@@ -43,6 +144,65 @@
 
   let explanations = {};
   let fetchingExplanations = {};
+  let reportDialogOpen = false;
+  let reportFeedback = '';
+  let reportSubmitting = false;
+  let reportMessage = '';
+
+  const openReportDialog = () => {
+    reportDialogOpen = true;
+    reportFeedback = '';
+    reportMessage = '';
+  };
+
+  const closeReportDialog = () => {
+    if (reportSubmitting) return;
+    reportDialogOpen = false;
+  };
+
+  const submitReportFeedback = async () => {
+    const feedbackText = reportFeedback.trim();
+    if (!feedbackText || reportSubmitting) return;
+
+    reportSubmitting = true;
+    reportMessage = '';
+    try {
+      const response = await fetch('/api/report-error', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          project: 'bridge2aikg',
+          page: 'author-info',
+          reportFolder: 'kg_error',
+          feedback: feedbackText,
+          currentUrl: typeof window !== 'undefined' ? window.location.href : null,
+          userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null,
+          context: {
+            selected_id: Number(datum?.metadata?.id) || null,
+            selected_name: String(datum?.metadata?.FullName || ''),
+            selected_is_author: Boolean(datum?.metadata?.IsAuthor),
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Request failed: ${response.status}`);
+      }
+      reportMessage = 'Thank you. Your feedback has been recorded.';
+      reportFeedback = '';
+      window.setTimeout(() => {
+        reportDialogOpen = false;
+        reportMessage = '';
+      }, 900);
+    } catch (error) {
+      console.error('Failed to submit report feedback:', error);
+      reportMessage = 'Failed to submit feedback. Please try again.';
+    } finally {
+      reportSubmitting = false;
+    }
+  };
 
   async function handleWhyRecommendClick(focalId, neighborId) {
     const key = `${focalId}_${neighborId}`;
@@ -218,40 +378,45 @@ ${papersList}
 </script>
 
 <div class="root">
+  <button class="close-details-btn" on:click={onClose} aria-label="Close details">×</button>
   <div class="details">
     <div class="info">
       {#if datum.metadata.IsAuthor}
-        <h2>
-          <a href="#" on:click|preventDefault={() => navigateTo(datum.metadata.id)}>
+        <h2 class="author-title">
+          <a href="#" on:click|preventDefault={() => openMatrixRecommendation(datum.metadata.id)}>
             {datum.metadata.FullName}
           </a>
         </h2>
-        <p><strong>Institution:</strong> {datum.metadata.Affiliation}</p>
-        <p><strong>Career Begin Year:</strong> {datum.metadata.BeginYear}</p>
-        <p><strong>Number of Papers:</strong> {datum.metadata.PaperNum}</p>
+        <div class="section-label">Institution</div>
+        <p class="section-value">{resolveAffiliation(datum.metadata)}</p>
+        <div class="papers-block">
+          <div class="section-label">Publications</div>
+          {#if loadingPaperTitles}
+            <p class="meta-line">Loading...</p>
+          {:else if selectedPaperTitles.length > 0}
+            <ul class="paper-list">
+              {#each selectedPaperTitles as p}
+                <li>
+                  {p.title}
+                  {#if p.year}
+                    <span class="paper-inline-meta"> ({p.year})</span>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {:else}
+            <p class="meta-line">No suitable publication titles available.</p>
+          {/if}
+        </div>
         <button
           class="rec_button"
           on:click={() => openMatrixRecommendation(datum.metadata.id)}
         >
-          MATRIX Interactive Recommendation.
-        </button> <br />
-        <span style="font-size: 14px;">
-          MATRIX: <b>M</b>ulti-<b>A</b>gent <b>T</b>eaming <b>R</b>ecommendation through <b>I</b>nteractive
-          <b>E</b>xpertise Gap <b>I</b>dentification.
-        </span>
-        <br />
-        <button
-          class="rec_button"
-          on:click={() =>
-            window.open(`https://www.google.com/search?q=${datum.metadata.FullName} ${datum.metadata.Affiliation}`)}
-        >
-          Google
+          Find Teaming Opportunities
         </button>
-        <!-- <button class="rec_button" onclick="window.open('https://www.google.com/search?q=' + encodeURIComponent('{datum.metadata.FullName} {datum.metadata.Affiliation}'));">
-        Find Talents by Typing down the Needs.
-      </button> -->
-        <br /><br />
-        <h3>Potential Future Collaborators: ({embeddingNeighbors[datum.index].length})</h3>
+        <button class="report-error-btn" on:click={openReportDialog}>
+          Report Error
+        </button>
       {/if}
       {#if !datum.metadata.IsAuthor}
         <h2>
@@ -261,12 +426,12 @@ ${papersList}
           </a>
         </h2>
         <!-- <p>Source: {datum.metadata.Data_Source}<p> -->
-        <p>
+        <p class="meta-line">
           <strong>Dataset Source:</strong>
           {datum.metadata.Data_Source}
         </p>
-        <p><strong>Description:</strong> {datum.metadata.Data_Description}</p>
-        <p>
+        <p class="meta-line"><strong>Description:</strong> {datum.metadata.Data_Description}</p>
+        <p class="meta-line">
           <strong>Dataset URL:</strong>
           <a href={datum.metadata.Data_url} target="_blank">{datum.metadata.Data_url}</a>
         </p>
@@ -285,14 +450,14 @@ ${papersList}
           Google
         </button>
         <br />
-        <h3>Potential Future Users ({embeddingNeighbors[datum.index].length})</h3>
       {/if}
 
       <!-- List of potential users or collaborators -->
 
       <!-- <p>Click a name below to show details</p> -->
       <!-- <button class="go-back" on:click={goBack}>Back</button> -->
-      <button class="go-back" on:click={() => viz?.flyTo(id)}>Back</button>
+      <button class="go-back" on:click={() => viz?.flyTo(id, { maxZoom: true })}>Re-center</button>
+      {#if SHOW_PRECOMPUTED_COLLABS}
       <ul>
           {#each embeddingNeighbors[datum.index]
             // Sort by BeginYear in descending order (later years first)
@@ -308,7 +473,7 @@ ${papersList}
                     {embeddedPointByID.get(neighborId).metadata.FullName}
                   </p>
                   <span style="font-size: 12px;">
-                    {embeddedPointByID.get(neighborId).metadata.Affiliation}<br />
+                    {resolveAffiliation(embeddedPointByID.get(neighborId).metadata)}<br />
                     {embeddedPointByID.get(neighborId).metadata.BeginYear}<br />
                     {(() => {
                       const neighbors = collaboratorsdict[datum.metadata.id] || [];
@@ -366,30 +531,87 @@ ${papersList}
             {/if}
           {/each}
         </ul>
+      {/if}
       <!-- Go Back Button -->
     </div>
   </div>
 </div>
 
+{#if reportDialogOpen}
+  <div class="report-modal-backdrop" on:click={closeReportDialog} role="button" tabindex="0" aria-label="Close report dialog">
+    <div class="report-modal" on:click|stopPropagation>
+      <h3>Report Error</h3>
+      <p class="report-modal-desc">Describe the issue in this author info panel.</p>
+      <textarea
+        class="report-textarea"
+        placeholder="Please enter your feedback..."
+        bind:value={reportFeedback}
+        rows="5"
+      />
+      {#if reportMessage}
+        <p class="report-message">{reportMessage}</p>
+      {/if}
+      <div class="report-actions">
+        <button class="report-cancel-btn" on:click={closeReportDialog} disabled={reportSubmitting}>Cancel</button>
+        <button
+          class="report-submit-btn"
+          on:click={submitReportFeedback}
+          disabled={reportSubmitting || !reportFeedback.trim()}
+        >
+          {reportSubmitting ? 'Submitting...' : 'Submit'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style lang="css">
   .root {
-    padding: 14px;
+    padding: 14px 22px 16px 14px;
     box-sizing: border-box;
-    background: rgba(255, 255, 255, 0.94);
-    border: 1px solid rgba(15, 23, 42, 0.14);
+    background: rgba(255, 255, 255, 0.98);
+    border: 1px solid #cbd5e1;
     border-radius: 12px;
-    box-shadow: 0 18px 40px rgba(15, 23, 42, 0.2);
+    box-shadow: 0 12px 28px rgba(15, 23, 42, 0.18);
     backdrop-filter: blur(8px);
     position: absolute;
-    top: 212px;
-    left: 10px;
-    bottom: 10px;
-    width: min(34vw, 420px);
-    overflow-y: auto;
+    top: auto;
+    left: auto;
+    right: 12px;
+    bottom: 12px;
+    width: clamp(320px, 34vw, 460px);
+    max-width: calc(100vw - 24px);
+    max-height: none;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
     align-items: flex-start;
     z-index: 25;
+    color: #0f172a !important;
+  }
+
+  .close-details-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 28px;
+    height: 28px;
+    border: 1px solid #cbd5e1;
+    border-radius: 999px;
+    background: #ffffff;
+    color: #334155;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  .close-details-btn:hover {
+    background-color: #f1f5f9;
+    color: #0f172a;
   }
 
   .details {
@@ -403,27 +625,61 @@ ${papersList}
   h2 {
     margin-top: 4px;
     margin-bottom: 8px;
-    font-size: 18px;
+    font-size: 20px;
     text-align: left;
-    line-height: 22px;
+    line-height: 24px;
+    color: #0b1220 !important;
+  }
+
+  .author-title {
+    margin-bottom: 10px;
+  }
+
+  .meta-line {
+    margin: 4px 0;
+  }
+
+  .papers-block {
+    margin-top: 6px;
+    margin-bottom: 10px;
+  }
+
+  .paper-list {
+    margin-top: 8px;
+    margin-left: 0;
+    padding-left: 16px;
+    padding-right: 6px;
+  }
+
+  .paper-list li {
+    margin: 6px 0;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .paper-inline-meta {
+    color: #334155 !important;
+    font-size: 12px;
   }
 
   h2 a {
-    color: #0f172a;
+    color: #0b1220 !important;
     text-decoration: none;
     transition: color 0.3s;
   }
 
   h2 a:hover {
-    color: #0369a1;
+    color: #0b57d0 !important;
   }
 
   p {
     font-size: 14px;
     font-weight: 500;
-    margin: 4px 0;
-    color: #334155;
-    padding: 4px 0;
+    margin: 2px 0;
+    color: #0f172a !important;
+    padding: 2px 0;
+    line-height: 1.45;
   }
 
   h3 {
@@ -466,18 +722,56 @@ ${papersList}
   }
 
   .rec_button {
-    font-size: 12px;
-    margin-top: 8px;
-    margin-bottom: 8px;
-    padding: 8px 12px;
-    background: linear-gradient(135deg, #0ea5e9, #14b8a6);
+    font-size: 13px;
+    margin-top: 10px;
+    margin-bottom: 4px;
+    padding: 9px 12px;
+    background: #0f172a;
     color: #fff;
-    border: 1px solid rgba(255, 255, 255, 0.18);
+    border: 1px solid #0f172a;
     border-radius: 7px;
     cursor: pointer;
-    transition: background-color 0.3s;
-    text-align: left;
+    transition: background-color 0.2s ease, border-color 0.2s ease;
+    text-align: center;
     font-weight: 700;
+    width: 100%;
+  }
+
+  .rec_button:hover {
+    background: #1e293b;
+    border-color: #1e293b;
+  }
+
+  .report-error-btn {
+    width: 100%;
+    margin-top: 8px;
+    padding: 8px 12px;
+    border-radius: 7px;
+    border: 1px solid #ef4444;
+    background: #fff1f2;
+    color: #b91c1c;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+  }
+
+  .report-error-btn:hover {
+    background: #ffe4e6;
+  }
+
+  .section-label {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #334155 !important;
+    margin: 2px 0 4px;
+  }
+
+  .section-value {
+    margin: 0 0 6px;
+    color: #0f172a !important;
   }
 
   .small_button {
@@ -495,45 +789,120 @@ ${papersList}
   }
 
   .go-back {
-    font-size: 11px;
+    font-size: 12px;
     margin-top: 8px;
-    margin-bottom: 8px;
+    margin-bottom: 4px;
     padding: 8px 12px;
-    background-color: #f8fafc;
+    background-color: #ffffff;
     color: #0f172a;
-    border: 1px solid rgba(148, 163, 184, 0.5);
+    border: 1px solid #94a3b8;
     border-radius: 7px;
     cursor: pointer;
-    transition: background-color 0.3s;
+    transition: background-color 0.2s ease;
   }
 
   .go-back:hover {
     background-color: #e2e8f0;
   }
 
-  /* Lighter, cleaner scrollbar for the details panel */
-  .root {
-    scrollbar-width: thin;
-    scrollbar-color: #94a3b8 #e2e8f0;
+  .report-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.52);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 80;
+    padding: 12px;
   }
 
-  .root::-webkit-scrollbar {
-    width: 10px;
+  .report-modal {
+    width: min(520px, calc(100vw - 24px));
+    background: #ffffff;
+    border-radius: 12px;
+    border: 1px solid #cbd5e1;
+    padding: 14px;
+    box-shadow: 0 18px 38px rgba(2, 6, 23, 0.3);
   }
 
-  .root::-webkit-scrollbar-track {
-    background: #e2e8f0;
-    border-radius: 10px;
+  .report-modal-desc {
+    margin-top: 4px;
+    margin-bottom: 10px;
+    color: #475569 !important;
   }
 
-  .root::-webkit-scrollbar-thumb {
-    background: #94a3b8;
-    border-radius: 10px;
-    border: 2px solid #e2e8f0;
+  .report-textarea {
+    width: 100%;
+    box-sizing: border-box;
+    border-radius: 8px;
+    border: 1px solid #cbd5e1;
+    background: #ffffff;
+    padding: 10px;
+    font-size: 14px;
+    color: #0f172a;
+    resize: vertical;
+    min-height: 110px;
+    color-scheme: light;
+    -webkit-text-fill-color: #0f172a;
   }
 
-  .root::-webkit-scrollbar-thumb:hover {
-    background: #64748b;
+  .report-textarea::placeholder {
+    color: #64748b;
+    opacity: 1;
+  }
+
+  .report-textarea:focus {
+    outline: none;
+    border-color: #0369a1;
+    box-shadow: 0 0 0 3px rgba(3, 105, 161, 0.12);
+  }
+
+  .report-message {
+    margin-top: 8px;
+    margin-bottom: 0;
+    color: #0f766e !important;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .report-actions {
+    margin-top: 10px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .report-cancel-btn,
+  .report-submit-btn {
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    background: #ffffff;
+    color: #0f172a;
+  }
+
+  .report-submit-btn {
+    border-color: #0369a1;
+    background: #0369a1;
+    color: #ffffff;
+  }
+
+  .report-cancel-btn:disabled,
+  .report-submit-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .papers-block strong,
+  .papers-block li,
+  .papers-block span,
+  .info strong,
+  .info a,
+  .info li {
+    color: #0f172a !important;
   }
 
   @media (max-width: 1200px) {
@@ -544,12 +913,12 @@ ${papersList}
 
   @media (max-width: 900px) {
     .root {
-      top: auto;
-      left: 10px;
-      right: 10px;
-      bottom: 10px;
-      width: auto;
-      max-height: 48vh;
+      left: auto;
+      right: 12px;
+      bottom: 12px;
+      width: min(460px, calc(100vw - 24px));
+      max-height: none;
+      overflow: hidden;
     }
   }
 </style>

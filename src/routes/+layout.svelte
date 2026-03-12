@@ -1,9 +1,11 @@
 <script lang="ts">
     import 'carbon-components-svelte/css/g100.css';
-    import { PUBLIC_GA_ID } from '$env/static/public';
+    import { env } from '$env/dynamic/public';
     import { maybeInitSentry } from '../sentry.js';
   
     import '../index.css';
+
+    const PUBLIC_GA_ID = env.PUBLIC_GA_ID;
   
     maybeInitSentry();
 

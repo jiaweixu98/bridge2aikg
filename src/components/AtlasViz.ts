@@ -23,7 +23,33 @@ const LABEL_HEIGHT = 50;
 const MAX_LABELS_PER_GRID_SQUARE = 3;
 const MIN_GRID_SQUARE_SIZE = 2;
 const MAX_GRID_SQUARE_SIZE = 64;
-const ESTIMATED_LABEL_MAX_WIDTH = 800;
+const ESTIMATED_LABEL_MAX_WIDTH = 460;
+
+const DENSITY_CONFIG = {
+  nodeSizeMin: 0.2,
+  nodeSizeMax: 0.8,
+  sizeScaleMode: 'log' as 'log' | 'linear',
+  initialZoom: 12,
+  zoomMin: 0.5,
+  zoomMax: 160,
+};
+const LOCAL_AVOIDANCE_ZOOM_THRESHOLD = 6.5;
+const LOCAL_AVOIDANCE_MAX_NODES = 1400;
+const LOCAL_AVOIDANCE_ITERATIONS = 5;
+const LOCAL_AVOIDANCE_MAX_OFFSET = 14;
+const STRICT_AVOIDANCE_ZOOM_THRESHOLD = 8;
+const STRICT_AVOIDANCE_CAMERA_HEIGHT_THRESHOLD = 72;
+const STRICT_AVOIDANCE_ZOOM_HEIGHT_THRESHOLD = 0.12;
+const STRICT_AVOIDANCE_MAX_NODES = 2600;
+const STRICT_AVOIDANCE_ITERATIONS = 12;
+const STRICT_AVOIDANCE_MIN_DISTANCE_MULTIPLIER = 1.03;
+const STRICT_AVOIDANCE_PUSH_FACTOR = 0.62;
+const STRICT_AVOIDANCE_MAX_OFFSET = 56;
+const LOCAL_AVOIDANCE_DEBOUNCE_MS = 280;
+const LABEL_UPDATE_INTERVAL_MS = 120;
+const LABEL_BUDGET_MULTIPLIER_WHILE_AVOIDANCE = 0.5;
+const BASE_GLOW_BOOST = 5;
+const MAX_RENDER_DEVICE_PIXEL_RATIO = 1.25;
 
 export enum ColorBy {
   CareerStartYear = 'BeginYear',
@@ -33,7 +59,7 @@ export enum ColorBy {
 const CUSTOM_GROUP_LABELS: { [key: string]: string } = {
   '0': 'Author Nodes',
   '1': 'Dataset Nodes',
-  '2': 'Bridge2AI Talents'
+  '2': 'Bridge2AI PIs'
 };
 
 export interface EmbeddedPointWithIndex extends EmbeddedPoint {
@@ -161,13 +187,20 @@ export class AtlasViz {
   private pointsContainer: PIXI.Container;
   private selectedNodeContainer: PIXI.Container;
   private decorationsContainer: PIXI.Container;
+  private persistentGlowContainer: PIXI.Container;
   private labelsContainer: PIXI.Container;
   private hoverLabelsContainer: PIXI.Container;
+  private selectedLabelContainer: PIXI.Container;
   private pointerCbs: {
     pointerMove: (evt: PointerEvent) => void;
+    pointerLeave: () => void;
     pointerDown: (evt: PIXI.InteractionEvent) => void;
     pointerUp: (evt: PIXI.InteractionEvent) => void;
   };
+  private debugInfoEl: HTMLElement | null = null;
+  private lastPointerInfo:
+    | { screenX: number; screenY: number; worldX: number; worldY: number }
+    | null = null;
   private textMeasurerCtx = (() => {
     const ctx = document.createElement('canvas').getContext('2d')!;
     ctx.font = `${BASE_LABEL_FONT_SIZE}px IBM Plex Sans`;
@@ -184,6 +217,7 @@ export class AtlasViz {
     background: PIXI.Sprite;
     connections: PIXI.Graphics | null;
   } | null = null;
+  private selectedNameLabel: PIXI.Graphics | null = null;
   private cachedNodeTexture: PIXI.Texture | null = null;
   private cachedRecTexture: PIXI.Texture | null = null;
   private cachedLabels: Map<string, NodeLabel> = new Map();
@@ -192,6 +226,35 @@ export class AtlasViz {
   private cachedGlobalLabelsByGridSize: Map<number, { datum: EmbeddedPointWithIndex; transformedBounds: Rectangle }[]> =
     new Map();
   private textWidthCache: Map<string, number> = new Map();
+  private densityNodeScaleMultiplier = 1.0;
+  private localAvoidanceOffsets: Float32Array;
+  private localAvoidanceActive = false;
+  private localAvoidanceLastKey = '';
+  private localAvoidanceTouchedIndices: number[] = [];
+  private localAvoidanceTimeout: number | null = null;
+  private labelUpdateTimeout: number | null = null;
+  private labelUpdateLastAtMs = 0;
+
+  private formatDebugNum = (value: number, precision = 2) => {
+    if (!Number.isFinite(value)) return 'N/A';
+    return value.toFixed(precision);
+  };
+
+  private updateDebugInfo = () => {
+    if (!this.debugInfoEl) return;
+    const scale = this.container?.scale?.x ?? 0;
+    const center = this.container?.center;
+    const visibleBounds = this.container?.getVisibleBounds();
+    const cameraHeight = visibleBounds?.height ?? NaN;
+    const pointerWorldText = this.lastPointerInfo
+      ? `${this.formatDebugNum(this.lastPointerInfo.worldX, 2)}, ${this.formatDebugNum(this.lastPointerInfo.worldY, 2)}`
+      : '-';
+
+    this.debugInfoEl.textContent =
+      `camera center: ${this.formatDebugNum(center?.x ?? NaN, 2)}, ${this.formatDebugNum(center?.y ?? NaN, 2)}\n` +
+      `camera height: ${this.formatDebugNum(cameraHeight, 3)}\n` +
+      `mouse(world): ${pointerWorldText}`;
+  };
 
   private measureText = (text: string): number => {
     const cached = this.textWidthCache.get(text);
@@ -336,11 +399,11 @@ export class AtlasViz {
         y1: BASE_RADIUS,
         r1: BASE_RADIUS,
         colorStops: [
-          { color: 0xffffff40, offset: 0 },
-          { color: 0xffffff34, offset: 0.1 },
-          { color: 0xffffff28, offset: 0.3 },
-          { color: 0xffffff04, offset: 0.6 },
-          { color: 0xffffff00, offset: 0.96 },
+          { color: 0xffffffcc, offset: 0 },
+          { color: 0xffffff99, offset: 0.14 },
+          { color: 0xffffff66, offset: 0.34 },
+          { color: 0xffffff1a, offset: 0.66 },
+          { color: 0xffffff00, offset: 1 },
         ],
       }
     );
@@ -352,37 +415,41 @@ export class AtlasViz {
   private buildNodeBackgroundSprite = (
     texture: PIXI.Texture,
     datum: EmbeddedPointWithIndex,
-    color: number
+    color: number,
+    radiusMultiplier = 1.6,
+    opacity = 0.7
   ): PIXI.Sprite => {
-    const nodeRadius = this.cachedNodeRadii[datum.index];
-    const radius = 5.8 + 1.2 * nodeRadius;
+    const nodeRadius = this.getRenderedNodeWorldRadius(datum.index);
+    // Keep glow proportional to node size, but with a minimum screen-visible radius.
+    const minVisibleRadiusWorld = 4.5 / Math.max(this.container.scale.x, 0.001);
+    const radius = Math.max(nodeRadius * radiusMultiplier, minVisibleRadiusWorld);
     const sprite = new this.PIXI.Sprite(texture);
-    sprite.blendMode = this.PIXI.BLEND_MODES.COLOR;
+    sprite.blendMode = this.PIXI.BLEND_MODES.ADD;
     sprite.interactive = false;
+    sprite.alpha = opacity;
     sprite.tint = color;
-    sprite.position.set(datum.vector.x, datum.vector.y);
+    const [rx, ry] = this.getRenderedPositionByIndex(datum.index);
+    sprite.position.set(rx, ry);
     sprite.anchor.set(0.5, 0.5);
     sprite.scale.set(radius / BASE_RADIUS);
     // console.log("nodeRadius",radius / BASE_RADIUS);
     return sprite;
   };
 
-  public displayMALUser(allMALData: CompatAnimeListEntry[]) {
-    // console.log('displayMALUser', allMALData);
-    const malData = allMALData;
-
-    this.renderedMALNodeIDs.clear();
-    malData.forEach((d) => this.renderedMALNodeIDs.add(d.node.id));
-    this.renderNodes();
-
+  private renderMALHighlightsByIDs = (ids: number[]) => {
     if (this.malProfileEntities) {
-      // this.decorationsContainer.removeChild(this.malProfileEntities.connections);
-      this.decorationsContainer.removeChild(this.malProfileEntities.pointGlowBackgrounds);
+      if (this.malProfileEntities.pointGlowBackgrounds.parent) {
+        this.malProfileEntities.pointGlowBackgrounds.parent.removeChild(this.malProfileEntities.pointGlowBackgrounds);
+      }
       this.malProfileEntities.pointGlowBackgrounds.destroy({ children: true });
-      // this.malProfileEntities.connections.destroy({ children: true });
       this.malProfileEntities = null;
     }
-    const pointGlowBackgrounds = new this.PIXI.ParticleContainer(allMALData.length, {
+
+    if (ids.length === 0) {
+      return;
+    }
+
+    const pointGlowBackgrounds = new this.PIXI.ParticleContainer(ids.length, {
       vertices: false,
       position: false,
       rotation: false,
@@ -393,21 +460,21 @@ export class AtlasViz {
     });
 
     const texture = this.getNodeBackgroundTexture();
-    malData.forEach((item) => {
+    ids.forEach((id) => {
       // TODO: Dynamic color based on rating?
       const color = MAL_NODE_COLOR;
-      const datum = this.embeddedPointByID.get(+item.node.id);
+      const datum = this.embeddedPointByID.get(id);
       if (!datum) {
-        console.warn(`Could not find embedded point for MAL data point ${item.node.id}`);
+        console.warn(`Could not find embedded point for MAL data point ${id}`);
         return;
       }
 
       const sprite = this.buildNodeBackgroundSprite(texture, datum, color);
       pointGlowBackgrounds.addChild(sprite);
     });
-    this.decorationsContainer.addChild(pointGlowBackgrounds);
+    this.persistentGlowContainer.addChild(pointGlowBackgrounds);
 
-    // const allMALNodeIDs = new Set(malData.map((d) => d.node.id));
+    // const allMALNodeIDs = new Set(ids);
     // const connections = new this.PIXI.Graphics();
     // connections.lineStyle(1, NEIGHBOR_LINE_COLOR, NEIGHBOR_LINE_OPACITY * 0.2, undefined, true);
     // allMALNodeIDs.forEach((id) => {
@@ -445,6 +512,14 @@ export class AtlasViz {
       pointGlowBackgrounds,
       // connections,
     };
+  };
+
+  public displayMALUser(allMALData: CompatAnimeListEntry[]) {
+    const normalizedIds = allMALData
+      .map((d) => Number(d.node.id))
+      .filter((id) => Number.isFinite(id));
+    this.renderedMALNodeIDs = new Set(normalizedIds);
+    this.renderNodes();
   }
 
   private getColorByTitle() {
@@ -501,7 +576,24 @@ export class AtlasViz {
     }
   };
 
-  private static getNodeRadius = (PaperNum: number) => Math.pow(PaperNum, 0.45) / 20;
+  private static getNodeRadius = (paperNum: number) => {
+    const minRadius = DENSITY_CONFIG.nodeSizeMin;
+    const maxRadius = DENSITY_CONFIG.nodeSizeMax;
+    const safePaperNum = Number.isFinite(paperNum) ? Math.max(1, paperNum) : 1;
+    const maxPaperNumForScaling = 200;
+    const growthExponent = 5.2;
+
+    let normalized = 0;
+    if (DENSITY_CONFIG.sizeScaleMode === 'linear') {
+      normalized = Math.min(1, safePaperNum / maxPaperNumForScaling);
+    } else {
+      normalized = Math.min(1, Math.log1p(safePaperNum) / Math.log1p(maxPaperNumForScaling));
+    }
+
+    // Compress most nodes near min size; only high-paper authors grow sharply.
+    const boostedTail = Math.pow(normalized, growthExponent);
+    return minRadius + boostedTail * (maxRadius - minRadius);
+  };
 
 
 
@@ -587,7 +679,7 @@ export class AtlasViz {
 
     for (let i = 0; i < amount; ++i) {
       const radius = this.cachedNodeRadii[i];
-      const scale = (radius / BASE_RADIUS) * adjustment;
+      const scale = (radius / BASE_RADIUS) * adjustment * this.densityNodeScaleMultiplier;
 
       array[offset] = w1 * scale;
       array[offset + 1] = h1 * scale;
@@ -640,6 +732,7 @@ export class AtlasViz {
     this.colorBy = getDefaultColorBy();
 
     this.visibleNodesIndicesScratch = new Uint32Array(embedding.length);
+    this.localAvoidanceOffsets = new Float32Array(embedding.length * 2);
     this.embeddedPointByID = new Map(this.embedding.map((p) => [+p.metadata.id, p]));
     this.setSelectedAnimeID = (newSelectedAnimeID: number | null) => {
       setSelectedAnimeID(newSelectedAnimeID);
@@ -656,15 +749,15 @@ export class AtlasViz {
     this.cachedNodeRadii = new Float32Array(embedding.length);
     for (let i = 0; i < embedding.length; i++) {
       const p = embedding[i];
-      // This why???
-      const radius = AtlasViz.getNodeRadius(p.metadata.PaperNum);
+      // Keep cached radii fully aligned with render-time sizing rules.
+      const radius = p.metadata.IsAuthor ? AtlasViz.getNodeRadius(p.metadata.PaperNum) : AtlasViz.getNodeRadius(200);
       this.cachedNodeRadii[i] = radius;
     }
 
     const canvas = document.getElementById(containerID)! as HTMLCanvasElement;
     this.app = new this.PIXI.Application({
-      antialias: true,
-      resolution: window.devicePixelRatio,
+      antialias: false,
+      resolution: Math.min(window.devicePixelRatio || 1, MAX_RENDER_DEVICE_PIXEL_RATIO),
       autoDensity: true,
       view: canvas,
       height: window.innerHeight,
@@ -681,9 +774,15 @@ export class AtlasViz {
 
     });
     this.container.drag({ mouseButtons: 'middle-left' }).pinch().wheel();
+    this.container.clampZoom({
+      minScale: DENSITY_CONFIG.zoomMin,
+      maxScale: DENSITY_CONFIG.zoomMax,
+    });
     // TODO: The initial transform probably needs to be relative to screen size
-    this.container.setTransform(1000.5, 400.5, 15, 15);
+    this.container.setTransform(1000.5, 400.5, DENSITY_CONFIG.initialZoom, DENSITY_CONFIG.initialZoom);
     this.container.moveCenter(-130, 210);
+    this.debugInfoEl = document.getElementById('atlas-viz-debug');
+    this.updateDebugInfo();
     window.addEventListener('resize', this.handleResize);
 
     // Need to do some hacky subclassing to enable big performance improvement
@@ -707,6 +806,11 @@ export class AtlasViz {
     this.decorationsContainer.interactive = false;
     this.decorationsContainer.interactiveChildren = false;
     this.container.addChild(this.decorationsContainer);
+
+    this.persistentGlowContainer = new this.PIXI.Container();
+    this.persistentGlowContainer.interactive = false;
+    this.persistentGlowContainer.interactiveChildren = false;
+    this.container.addChild(this.persistentGlowContainer);
 
     // this.pointsContainer = new NodesParticleContainer(embedding.length, {
     //   vertices: true,
@@ -735,51 +839,83 @@ export class AtlasViz {
     this.hoverLabelsContainer.interactiveChildren = false;
     this.container.addChild(this.hoverLabelsContainer);
 
+    this.selectedLabelContainer = new this.PIXI.Container();
+    this.selectedLabelContainer.interactive = false;
+    this.selectedLabelContainer.interactiveChildren = false;
+    this.container.addChild(this.selectedLabelContainer);
+
     // When zooming in and out, scale the circles in the opposite direction a bit to open up some space when
     // zooming in to dense areas and keeping structure when zooming out far.
     let lastCenter = this.container.center;
     let lastScale = this.container.scale.x;
+    let wasZooming = this.container.zooming;
 
     this.app.ticker.add(() => {
       const newScale = this.container.scale.x;
+      const scaleChanged = newScale !== lastScale;
+      const centerChanged =
+        lastCenter.x !== this.container.center.x || lastCenter.y !== this.container.center.y;
+      const isZooming = this.container.zooming;
+      const zoomStateChanged = isZooming !== wasZooming;
 
-      if (
-        lastCenter.x === this.container.center.x &&
-        lastCenter.y === this.container.center.y &&
-        newScale === lastScale
-      ) {
+      if (!centerChanged && !scaleChanged && !zoomStateChanged) {
         return;
       }
 
       lastCenter = this.container.center;
-      this.updateLabels();
-
-      if (newScale === lastScale) {
-        return;
-      }
       lastScale = newScale;
 
-      const adjustment = this.getNodeRadiusAdjustment(newScale);
+      // During wheel zoom interaction, skip expensive refresh paths entirely.
+      // Rebuild once when zooming stops.
+      if (isZooming) {
+        this.labelsContainer.visible = false;
+        this.hoverLabelsContainer.visible = false;
+        this.selectedLabelContainer.visible = false;
+        wasZooming = true;
+        return;
+      }
+
+      this.scheduleLocalAvoidance();
+      if (zoomStateChanged) {
+        this.labelsContainer.visible = true;
+        this.hoverLabelsContainer.visible = true;
+        this.selectedLabelContainer.visible = true;
+        this.updateDensityScale();
+        this.scheduleLabelUpdate(true);
+      } else {
+        this.scheduleLabelUpdate();
+        if (scaleChanged) {
+          this.updateDensityScale();
+        }
+      }
 
       // || This is now computed in our overridden `uploadVertices` function to avoid the overhead
       // \/ of setting it on each node directly like this
       //
       // this.pointsContainer.children.forEach((c, i) => {
       //   const radius = this.cachedNodeRadii[i];
-      //   c.transform.scale.set((radius / BASE_RADIUS) * adjustment);
+      //   c.transform.scale.set((radius / BASE_RADIUS) * this.getNodeRadiusAdjustment(newScale));
       // });
 
       if (this.selectedNode) {
         const index = this.embeddedPointByID.get(this.selectedNode.id)!.index;
-        const radius = this.cachedNodeRadii[index];
-        // # double check
-        this.selectedNode.node.transform.scale.set((radius / BASE_RADIUS) * adjustment);
+        const radius = this.getRenderedNodeWorldRadius(index);
+        this.selectedNode.node.transform.scale.set(radius / BASE_RADIUS);
       }
 
       this.hoverLabelsContainer.children.forEach((g) => {
         const d = (g as any).datum;
-        this.setLabelScale(g as PIXI.Graphics, d, adjustment);
+        this.setLabelScale(g as PIXI.Graphics, d);
       });
+
+      if (this.selectedNameLabel && this.selectedNode) {
+        const selectedDatum = this.embeddedPointByID.get(this.selectedNode.id);
+        if (selectedDatum) {
+          this.setLabelScale(this.selectedNameLabel as PIXI.Graphics, selectedDatum);
+        }
+      }
+      wasZooming = false;
+      this.updateDebugInfo();
     });
 
     this.app.stage.addChild(this.container);
@@ -796,15 +932,20 @@ export class AtlasViz {
         }
 
         const worldPoint = this.container.toWorld(evt.offsetX, evt.offsetY);
+        this.lastPointerInfo = {
+          screenX: evt.offsetX,
+          screenY: evt.offsetY,
+          worldX: worldPoint.x,
+          worldY: worldPoint.y,
+        };
+        this.updateDebugInfo();
 
-        const newScale = this.container.scale.x;
-        const adjustment = this.getNodeRadiusAdjustment(newScale);
         let datum: EmbeddedPointWithIndex | undefined;
         for (let i = this.embedding.length - 1; i >= 0; i--) {
           const p = this.embedding[i];
-          const radius = this.cachedNodeRadii[i] * adjustment;
-          const centerX = this.embeddingPositions[i * 2];
-          const centerY = this.embeddingPositions[i * 2 + 1];
+          const radius = this.getRenderedNodeWorldRadius(i);
+          const centerX = this.embeddingPositions[i * 2] + this.localAvoidanceOffsets[i * 2];
+          const centerY = this.embeddingPositions[i * 2 + 1] + this.localAvoidanceOffsets[i * 2 + 1];
           const hitTest = Math.abs(worldPoint.x - centerX) < 2 * radius && Math.abs(worldPoint.y - centerY) < 2 * radius;
 
           if (hitTest) {
@@ -825,6 +966,10 @@ export class AtlasViz {
         }
 
         this.container.cursor = hoveredDatum ? 'pointer' : containerPointerDownPos ? 'grabbing' : 'default';
+      },
+      pointerLeave: () => {
+        this.lastPointerInfo = null;
+        this.updateDebugInfo();
       },
       pointerDown: (evt: PIXI.InteractionEvent) => {
         // Ignore right clicks
@@ -853,6 +998,7 @@ export class AtlasViz {
     };
 
     canvas.addEventListener('pointermove', this.pointerCbs.pointerMove);
+    canvas.addEventListener('pointerleave', this.pointerCbs.pointerLeave);
     this.container.on('pointerdown', this.pointerCbs.pointerDown).on('pointerup', this.pointerCbs.pointerUp);
     this.setColorBy(this.colorBy);
 
@@ -867,6 +1013,7 @@ export class AtlasViz {
     const width = Math.min(window.innerWidth, this.maxCanvasWidth ?? Infinity);
     this.app.renderer.resize(width, window.innerHeight);
     this.container.resize(width, window.innerHeight);
+    this.updateDebugInfo();
   };
 
   private getNodeRadiusAdjustment = (newZoomScale: number) => {
@@ -874,6 +1021,267 @@ export class AtlasViz {
     adjustment = (adjustment + adjustment + adjustment + 1 + 1) / 5;
     adjustment = Math.min(adjustment, 1.5);
     return adjustment;
+  };
+
+  private shouldRenderNode = (point: EmbeddedPointWithIndex | undefined | null) => {
+    if (!point?.metadata) return false;
+    const category = String(point.metadata.color_category);
+    if (!this.visibleCategories.has(category)) return false;
+    if (point.metadata.IsAuthor) {
+      const numPubs = point.metadata.PaperNum;
+      const beginYear = point.metadata.BeginYear;
+      if (
+        numPubs < this.publicationRange[0] || numPubs > this.publicationRange[1] ||
+        beginYear < this.beginYearRange[0] || beginYear > this.beginYearRange[1]
+      ) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  private getRenderedPositionByIndex = (idx: number): [number, number] => {
+    return [
+      this.embeddingPositions[idx * 2] + this.localAvoidanceOffsets[idx * 2],
+      this.embeddingPositions[idx * 2 + 1] + this.localAvoidanceOffsets[idx * 2 + 1],
+    ];
+  };
+
+  /**
+   * World-space radius actually used by rendered node sprites.
+   * Keep collision and hit-testing in sync with this value.
+   */
+  private getRenderedNodeWorldRadius = (idx: number): number => {
+    return this.cachedNodeRadii[idx] * this.densityNodeScaleMultiplier;
+  };
+
+  private clearLocalAvoidanceOffsets = () => {
+    if (this.localAvoidanceTouchedIndices.length === 0) return false;
+    for (const idx of this.localAvoidanceTouchedIndices) {
+      this.localAvoidanceOffsets[idx * 2] = 0;
+      this.localAvoidanceOffsets[idx * 2 + 1] = 0;
+    }
+    this.localAvoidanceTouchedIndices = [];
+    this.localAvoidanceActive = false;
+    this.localAvoidanceLastKey = '';
+    return true;
+  };
+
+  private scheduleLocalAvoidance = () => {
+    if (this.localAvoidanceTimeout !== null) {
+      window.clearTimeout(this.localAvoidanceTimeout);
+    }
+    this.localAvoidanceTimeout = window.setTimeout(() => {
+      this.localAvoidanceTimeout = null;
+      // Recompute density scale once interaction settles.
+      this.updateDensityScale();
+      this.runLocalAvoidanceIfNeeded();
+    }, LOCAL_AVOIDANCE_DEBOUNCE_MS);
+  };
+
+  private scheduleLabelUpdate = (force = false) => {
+    const now = performance.now();
+    if (force || now - this.labelUpdateLastAtMs >= LABEL_UPDATE_INTERVAL_MS) {
+      this.labelUpdateLastAtMs = now;
+      this.updateLabels();
+      return;
+    }
+    if (this.labelUpdateTimeout !== null) {
+      return;
+    }
+    const delay = Math.max(0, LABEL_UPDATE_INTERVAL_MS - (now - this.labelUpdateLastAtMs));
+    this.labelUpdateTimeout = window.setTimeout(() => {
+      this.labelUpdateTimeout = null;
+      this.labelUpdateLastAtMs = performance.now();
+      this.updateLabels();
+    }, delay);
+  };
+
+  private runLocalAvoidanceIfNeeded = () => {
+    const scale = this.container.scale.x;
+    if (scale < LOCAL_AVOIDANCE_ZOOM_THRESHOLD) {
+      if (this.clearLocalAvoidanceOffsets()) {
+        this.renderNodes();
+        if (this.selectedNode) {
+          const selectedId = this.selectedNode.id;
+          const sprites = this.renderSelectedNodeObjects(selectedId);
+          this.selectedNode = sprites ? { id: selectedId, ...sprites } : null;
+        }
+      }
+      return;
+    }
+
+    const center = this.container.center;
+    const visibleBounds = this.container.getVisibleBounds();
+    const cameraHeight = visibleBounds.height;
+    const zoomInHeight = 1 / Math.max(scale, 1e-9);
+    const strictAvoidanceMode =
+      scale > STRICT_AVOIDANCE_ZOOM_THRESHOLD ||
+      cameraHeight < STRICT_AVOIDANCE_CAMERA_HEIGHT_THRESHOLD ||
+      zoomInHeight < STRICT_AVOIDANCE_ZOOM_HEIGHT_THRESHOLD;
+    const stateKey = `${Math.round(scale * 10)}|${Math.round(center.x * 2)}|${Math.round(center.y * 2)}|${Math.round(
+      cameraHeight * 10
+    )}|${strictAvoidanceMode ? 1 : 0}`;
+    if (stateKey === this.localAvoidanceLastKey) {
+      return;
+    }
+    this.localAvoidanceLastKey = stateKey;
+
+    this.clearLocalAvoidanceOffsets();
+
+    const visible = Array.from(this.computeVisibleNodeIndices(visibleBounds, false))
+      .map((i) => this.embedding[i])
+      .filter((p): p is EmbeddedPointWithIndex => this.shouldRenderNode(p));
+
+    if (visible.length < 2) {
+      return;
+    }
+
+    const maxNodes = strictAvoidanceMode ? STRICT_AVOIDANCE_MAX_NODES : LOCAL_AVOIDANCE_MAX_NODES;
+    const candidates = visible.length <= maxNodes
+      ? visible
+      : [...visible]
+          .sort((a, b) => this.cachedNodeRadii[b.index] - this.cachedNodeRadii[a.index])
+          .slice(0, maxNodes);
+
+    const n = candidates.length;
+    const posX = new Float32Array(n);
+    const posY = new Float32Array(n);
+    const rad = new Float32Array(n);
+    const deltaX = new Float32Array(n);
+    const deltaY = new Float32Array(n);
+    const indexByNode = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      const idx = candidates[i].index;
+      indexByNode[i] = idx;
+      posX[i] = this.embeddingPositions[idx * 2];
+      posY[i] = this.embeddingPositions[idx * 2 + 1];
+      rad[i] = this.getRenderedNodeWorldRadius(idx);
+    }
+
+    const grid = new Map<string, number[]>();
+    const avgRadius = rad.reduce((acc, v) => acc + v, 0) / Math.max(1, n);
+    const cellSize = Math.max(3.2, avgRadius * 3.2);
+    const iterations = strictAvoidanceMode ? STRICT_AVOIDANCE_ITERATIONS : LOCAL_AVOIDANCE_ITERATIONS;
+    const minDistanceMultiplier = strictAvoidanceMode ? STRICT_AVOIDANCE_MIN_DISTANCE_MULTIPLIER : 0.9;
+    const pushFactor = strictAvoidanceMode ? STRICT_AVOIDANCE_PUSH_FACTOR : 0.48;
+    for (let iter = 0; iter < iterations; iter++) {
+      grid.clear();
+      deltaX.fill(0);
+      deltaY.fill(0);
+
+      for (let i = 0; i < n; i++) {
+        const cx = Math.floor(posX[i] / cellSize);
+        const cy = Math.floor(posY[i] / cellSize);
+        const key = `${cx},${cy}`;
+        const list = grid.get(key);
+        if (list) list.push(i);
+        else grid.set(key, [i]);
+      }
+
+      for (let i = 0; i < n; i++) {
+        const cx = Math.floor(posX[i] / cellSize);
+        const cy = Math.floor(posY[i] / cellSize);
+        for (let ox = -1; ox <= 1; ox++) {
+          for (let oy = -1; oy <= 1; oy++) {
+            const neighbors = grid.get(`${cx + ox},${cy + oy}`);
+            if (!neighbors) continue;
+            for (const j of neighbors) {
+              if (j <= i) continue;
+              let dx = posX[j] - posX[i];
+              let dy = posY[j] - posY[i];
+              const minDist = (rad[i] + rad[j]) * minDistanceMultiplier;
+              const d2 = dx * dx + dy * dy;
+              if (d2 >= minDist * minDist) continue;
+              let dist = Math.sqrt(Math.max(d2, 1e-9));
+
+              // If two nodes are at (nearly) identical positions, synthesize a deterministic
+              // direction so they can be separated instead of staying locked together.
+              if (dist < 1e-4) {
+                const angle = ((i * 73856093) ^ (j * 19349663)) * 0.000001;
+                dx = Math.cos(angle);
+                dy = Math.sin(angle);
+                dist = 1;
+              }
+
+              const overlap = minDist - dist;
+              const ux = dx / dist;
+              const uy = dy / dist;
+              const push = overlap * pushFactor;
+              deltaX[i] -= ux * push;
+              deltaY[i] -= uy * push;
+              deltaX[j] += ux * push;
+              deltaY[j] += uy * push;
+            }
+          }
+        }
+      }
+
+      for (let i = 0; i < n; i++) {
+        posX[i] += deltaX[i];
+        posY[i] += deltaY[i];
+      }
+    }
+
+    for (let i = 0; i < n; i++) {
+      const idx = indexByNode[i];
+      const baseX = this.embeddingPositions[idx * 2];
+      const baseY = this.embeddingPositions[idx * 2 + 1];
+      let ox = posX[i] - baseX;
+      let oy = posY[i] - baseY;
+      const mag = Math.sqrt(ox * ox + oy * oy);
+      const maxOffset = strictAvoidanceMode
+        ? Math.min(
+            STRICT_AVOIDANCE_MAX_OFFSET,
+            Math.max(LOCAL_AVOIDANCE_MAX_OFFSET, LOCAL_AVOIDANCE_MAX_OFFSET * (scale / STRICT_AVOIDANCE_ZOOM_THRESHOLD))
+          )
+        : LOCAL_AVOIDANCE_MAX_OFFSET;
+      if (mag > maxOffset) {
+        const s = maxOffset / mag;
+        ox *= s;
+        oy *= s;
+      }
+      if (Math.abs(ox) < 1e-3 && Math.abs(oy) < 1e-3) continue;
+      this.localAvoidanceOffsets[idx * 2] = ox;
+      this.localAvoidanceOffsets[idx * 2 + 1] = oy;
+      this.localAvoidanceTouchedIndices.push(idx);
+    }
+
+    this.localAvoidanceActive = this.localAvoidanceTouchedIndices.length > 0;
+    this.renderNodes();
+    if (this.selectedNode) {
+      const selectedId = this.selectedNode.id;
+      const sprites = this.renderSelectedNodeObjects(selectedId);
+      this.selectedNode = sprites ? { id: selectedId, ...sprites } : null;
+    }
+  };
+
+  private updateDensityScale = () => {
+    const visible = this.computeVisibleNodeIndices(this.container.getVisibleBounds(), false);
+    const sampleCount = Math.min(visible.length, 120);
+    if (sampleCount < 8) {
+      this.densityNodeScaleMultiplier = 1.0;
+      return;
+    }
+    let overlapLikePairs = 0;
+    const maxPairs = sampleCount * (sampleCount - 1);
+    for (let i = 0; i < sampleCount; i++) {
+      const a = this.embedding[visible[i]];
+      const ar = this.getRenderedNodeWorldRadius(a.index);
+      for (let j = i + 1; j < sampleCount; j++) {
+        const b = this.embedding[visible[j]];
+        const br = this.getRenderedNodeWorldRadius(b.index);
+        const dx = a.vector.x - b.vector.x;
+        const dy = a.vector.y - b.vector.y;
+        const d2 = dx * dx + dy * dy;
+        const threshold = (ar + br) * 1.1;
+        if (d2 < threshold * threshold) {
+          overlapLikePairs += 2;
+        }
+      }
+    }
+    const ratio = overlapLikePairs / Math.max(1, maxPairs);
+    this.densityNodeScaleMultiplier = ratio > 0.18 ? 0.8 : 1.0;
   };
 
   private handlePointerOver = (datum: EmbeddedPointWithIndex) => {
@@ -895,6 +1303,27 @@ export class AtlasViz {
       title: datum.metadata.FullName,
     });
     this.setSelectedAnimeID(datum.metadata.id);
+  };
+
+  private updateSelectedNameLabel = (selectedAnimeID: number | null) => {
+    if (this.selectedNameLabel) {
+      this.selectedNameLabel.parent?.removeChild(this.selectedNameLabel);
+      this.selectedNameLabel.destroy({ children: true });
+      this.selectedNameLabel = null;
+    }
+
+    if (selectedAnimeID == null) {
+      return;
+    }
+
+    const datum = this.embeddedPointByID.get(selectedAnimeID);
+    if (!datum) {
+      return;
+    }
+
+    const label = this.buildHoverLabel(datum);
+    this.selectedLabelContainer.addChild(label);
+    this.selectedNameLabel = label;
   };
 
   private getNodeTexture = (): PIXI.Texture => {
@@ -936,18 +1365,15 @@ export class AtlasViz {
   };
 
   private buildNodeSprite = (texture: PIXI.Texture, point: EmbeddedPoint) => {
-    let radius;
-    if (point.metadata.IsAuthor === true) {
-      radius = AtlasViz.getNodeRadius(point.metadata.PaperNum);
-    } else {
-      radius = AtlasViz.getNodeRadius(200);
-    }
     const nodeSprite = new this.PIXI.Sprite(texture);
     nodeSprite.anchor.set(0.5, 0.5);
     nodeSprite.interactive = false;
-    nodeSprite.position.set(point.vector.x, point.vector.y);
+    const idx = (point as EmbeddedPointWithIndex).index;
+    const radius = this.cachedNodeRadii[idx];
+    const [rx, ry] = this.getRenderedPositionByIndex(idx);
+    nodeSprite.position.set(rx, ry);
     // nodeSprite.scale.set((radius / BASE_RADIUS) * this.getNodeRadiusAdjustment(this.container.scale.x));
-    nodeSprite.scale.set((radius / BASE_RADIUS));
+    nodeSprite.scale.set((radius / BASE_RADIUS) * this.densityNodeScaleMultiplier);
     const color = this.getNodeColor(point);
     nodeSprite.tint = color;
     return nodeSprite;
@@ -956,8 +1382,11 @@ export class AtlasViz {
 
 
   private renderNodes() {
-    // Delete glows
+    // Delete transient overlays
     this.decorationsContainer.removeChildren().forEach(c => c.destroy({ texture: false, children: true }));
+    // Persistent glow layer is rebuilt every render so zoom/avoidance paths can't desync it.
+    this.persistentGlowContainer.removeChildren().forEach(c => c.destroy({ texture: false, children: true }));
+    this.malProfileEntities = null;
     // Delete nodes
     this.pointsContainer.removeChildren().forEach((c) => c.destroy({ texture: false, children: true }));
     // Clear label cache, update Labels 
@@ -992,14 +1421,25 @@ export class AtlasViz {
       const nodeSprite = this.buildNodeSprite(texture, point);
       this.pointsContainer.addChild(nodeSprite);
 
-      // Add special background glow for Bridge2AI Talents (category 2)
-      if (point.metadata.color_category === 2) {
-        const backgroundSprite = this.buildNodeBackgroundSprite(nodeBackgroundTexture, point, 0xFFD700);
-        backgroundSprite.scale.x *= 1.5;
-        backgroundSprite.scale.y *= 1.5;
-        this.decorationsContainer.addChild(backgroundSprite);
+      // Keep baseline glow only for Bridge2AI PI seeds.
+      // Dataset nodes (category 1) should render without halo.
+      const colorCategoryNum = Number(point.metadata.color_category);
+      if (colorCategoryNum === 2) {
+        const baseGlowRadiusMultiplier = colorCategoryNum === 2 ? 3 : 2;
+        const glowRadiusMultiplier = baseGlowRadiusMultiplier * BASE_GLOW_BOOST;
+        const glowColor = this.getNodeColor(point);
+        const backgroundSprite = this.buildNodeBackgroundSprite(
+          nodeBackgroundTexture,
+          point,
+          glowColor,
+          glowRadiusMultiplier,
+          colorCategoryNum === 2 ? 1 : 0.95
+        );
+        this.persistentGlowContainer.addChild(backgroundSprite);
       }
     });
+    this.updateDensityScale();
+    this.renderMALHighlightsByIDs(Array.from(this.renderedMALNodeIDs));
     // Clear label cache, update Labels 
     this.labelsContainer.removeChildren();
     this.hoverLabelsContainer.removeChildren();
@@ -1021,6 +1461,7 @@ export class AtlasViz {
     }
 
     if (selectedAnimeID == null) {
+      this.updateSelectedNameLabel(null);
       return;
     }
 
@@ -1041,8 +1482,6 @@ export class AtlasViz {
 
     const nodeBackgroundTexture = this.getNodeBackgroundTexture();
     const backgroundSprite = this.buildNodeBackgroundSprite(nodeBackgroundTexture, point, SELECTED_NODE_COLOR);
-    backgroundSprite.scale.x *= 1.5;
-    backgroundSprite.scale.y *= 1.5;
     this.decorationsContainer.addChild(backgroundSprite);
     // console.log(point)
     // console.log(texture);
@@ -1052,6 +1491,7 @@ export class AtlasViz {
       this.decorationsContainer.addChild(connections);
     }
 
+    this.updateSelectedNameLabel(selectedAnimeID);
     return { node: nodeSprite, background: backgroundSprite, connections };
   }
 
@@ -1068,23 +1508,84 @@ export class AtlasViz {
     this.renderLegend();
   }
 
+  public setLabelsVisible = (visible: boolean) => {
+    this.labelsContainer.visible = visible;
+    this.hoverLabelsContainer.visible = visible;
+    this.selectedLabelContainer.visible = visible;
 
-  public flyTo = (id: number) => {
+    const legendContainer = document.getElementById('atlas-viz-legend');
+    if (legendContainer) {
+      legendContainer.style.display = visible ? '' : 'none';
+    }
+
+    if (!visible) {
+      this.labelsContainer.removeChildren() as NodeLabel[];
+      this.hoverLabelsContainer.removeChildren();
+      this.selectedLabelContainer.removeChildren();
+      return;
+    }
+
+    this.scheduleLabelUpdate(true);
+  };
+
+
+  public flyTo = (id: number, opts?: { maxZoom?: boolean; targetScale?: number }) => {
     captureMessage('Fly to node in atlas', { id, FullName: this.embeddedPointByID.get(id)?.metadata.FullName });
     this.setSelectedAnimeID(id);
     const { x, y } = this.embedding.find((p) => p.metadata.id === id)!.vector;
+    const targetScale = opts?.targetScale ?? (opts?.maxZoom ? DENSITY_CONFIG.zoomMax : 8);
     this.container.animate({
       time: 500,
       position: { x, y },
-      scale: 8,
+      scale: targetScale,
       ease: (curTime: number, minVal: number, maxVal: number, maxTime: number): number => {
         // cubic ease in out
         const t = curTime / maxTime;
         const p = t * t * t;
         return minVal + (maxVal - minVal) * p;
       },
-      callbackOnComplete: () => this.updateLabels(),
+      callbackOnComplete: () => this.scheduleLabelUpdate(true),
     });
+  };
+
+  public setCameraCenterAndHeight = (centerX: number, centerY: number, cameraHeight: number) => {
+    const safeHeight = Math.max(cameraHeight, 1e-3);
+    const targetScale = Math.min(
+      DENSITY_CONFIG.zoomMax,
+      Math.max(DENSITY_CONFIG.zoomMin, this.app.renderer.height / safeHeight)
+    );
+    this.container.setZoom(targetScale, true);
+    this.container.moveCenter(centerX, centerY);
+    this.updateDensityScale();
+    this.scheduleLabelUpdate(true);
+  };
+
+  public flyToCameraOnly = async (
+    id: number,
+    opts?: { maxZoom?: boolean; targetScale?: number; timeMs?: number }
+  ): Promise<boolean> => {
+    const target = this.embedding.find((p) => p.metadata.id === id);
+    if (!target) return false;
+
+    const targetScale = opts?.targetScale ?? (opts?.maxZoom ? DENSITY_CONFIG.zoomMax : 8);
+    const timeMs = opts?.timeMs ?? 500;
+    await new Promise<void>((resolve) => {
+      this.container.animate({
+        time: timeMs,
+        position: { x: target.vector.x, y: target.vector.y },
+        scale: targetScale,
+        ease: (curTime: number, minVal: number, maxVal: number, maxTime: number): number => {
+          const t = curTime / maxTime;
+          const p = t * t * t;
+          return minVal + (maxVal - minVal) * p;
+        },
+        callbackOnComplete: () => {
+          this.scheduleLabelUpdate(true);
+          resolve();
+        },
+      });
+    });
+    return true;
   };
 
   private getTextScale = () => {
@@ -1096,14 +1597,14 @@ export class AtlasViz {
   private setLabelScale = (
     g: PIXI.DisplayObject,
     datum: EmbeddedPointWithIndex,
-    adjustment: number,
     scaleOverride?: number
   ) => {
     g.transform.scale.set(scaleOverride ?? this.getTextScale());
-    const radius = this.cachedNodeRadii[datum.index] * adjustment;
-    g.position.set(datum.vector.x, datum.vector.y - radius);
-    const circleRadius = AtlasViz.getNodeRadius(datum.metadata.PaperNum);
-    g.position.y -= 12 * (1 / this.container.scale.x) + circleRadius * 0.0023 * this.container.scale.x;
+    const baseRadius = this.cachedNodeRadii[datum.index];
+    const radius = this.getRenderedNodeWorldRadius(datum.index);
+    const [rx, ry] = this.getRenderedPositionByIndex(datum.index);
+    g.position.set(rx, ry - radius);
+    g.position.y -= 12 * (1 / this.container.scale.x) + baseRadius * 0.0023 * this.container.scale.x;
   };
 
   private buildHoverLabel = (datum: EmbeddedPointWithIndex): PIXI.Graphics => {
@@ -1118,7 +1619,7 @@ export class AtlasViz {
     g.interactiveChildren = false;
 
     (g as any).datum = datum;
-    this.setLabelScale(g, datum, this.getNodeRadiusAdjustment(this.container.scale.x));
+    this.setLabelScale(g, datum);
     // set origin to center of text
     g.pivot.set(textWidth / 2, 25);
 
@@ -1271,9 +1772,15 @@ export class AtlasViz {
   public setNeighbors(neighbors: number[][]) {
     this.neighbors = neighbors;
   }
-  public setCollabID(collabID: number) {
+  public setCollabID(collabID: number | null) {
     this.collabID = collabID;
   }
+
+  public resetSelectionAndHighlights = () => {
+    this.setSelectedAnimeID(null);
+    this.setCollabID(null);
+    this.displayMALUser([]);
+  };
   public setCollaboratorsDict(CollaboratorsDict) {
     this.CollaboratorsDict = CollaboratorsDict;
   }
@@ -1312,7 +1819,75 @@ export class AtlasViz {
   };
 
   private getBaseLabelScale = (gridSquareSize: number) => {
-    return (gridSquareSize / 32) * 0.03;
+    // Keep global labels at a readable, near-constant screen size similar to selected labels.
+    const zoomAware = this.getTextScale();
+    const tierMultiplier =
+      gridSquareSize >= 64 ? 1.05 :
+        gridSquareSize >= 32 ? 1.0 :
+          gridSquareSize >= 16 ? 0.95 :
+            gridSquareSize >= 8 ? 0.9 : 0.86;
+    const scaled = zoomAware * tierMultiplier;
+    return Math.max(0.008, Math.min(scaled, 0.06));
+  };
+
+  private getLabelVisibilityProgress = () => {
+    const z = this.container.scale.x;
+    const hideZoom = 0.9;
+    const fullZoom = 6;
+    if (z <= hideZoom) {
+      return 0;
+    }
+    if (z >= fullZoom) {
+      return 1;
+    }
+    const t = (z - hideZoom) / (fullZoom - hideZoom);
+    // smoothstep for gradual label increase while zooming in
+    return t * t * (3 - 2 * t);
+  };
+
+  private getAdaptiveMaxLabelsPerGridSquare = (gridSquareSize: number) => {
+    const visibilityProgress = this.getLabelVisibilityProgress();
+    if (visibilityProgress <= 0) {
+      return 0;
+    }
+    const baseMax =
+      gridSquareSize >= 64 ? 2 :
+        gridSquareSize >= 32 ? 4 :
+          gridSquareSize >= 16 ? 7 :
+            gridSquareSize >= 8 ? 10 : 14;
+    return Math.max(1, Math.round(baseMax * (0.25 + 0.75 * visibilityProgress)));
+  };
+
+  private getAdaptiveLabelBudget = (gridSquareSize: number) => {
+    const visibilityProgress = this.getLabelVisibilityProgress();
+    if (visibilityProgress <= 0) {
+      return 0;
+    }
+    const screenArea = this.app.renderer.width * this.app.renderer.height;
+    const megapixels = Math.max(0.6, screenArea / 1_000_000);
+    // Fewer labels when zoomed out; more labels when zoomed in.
+    const densityPerMp =
+      gridSquareSize >= 64 ? 24 :
+        gridSquareSize >= 32 ? 44 :
+          gridSquareSize >= 16 ? 72 :
+            gridSquareSize >= 8 ? 110 : 150;
+    const rawBudget = Math.round(densityPerMp * megapixels);
+    const rampedBudget = Math.round(rawBudget * (0.12 + 0.88 * visibilityProgress));
+    return Math.max(24, Math.min(620, rampedBudget));
+  };
+
+  private compareDatumPriority = (a: EmbeddedPointWithIndex, b: EmbeddedPointWithIndex) => {
+    const aIsSeed = a.metadata.IsAuthor && a.metadata.color_category === 2 ? 1 : 0;
+    const bIsSeed = b.metadata.IsAuthor && b.metadata.color_category === 2 ? 1 : 0;
+    if (bIsSeed !== aIsSeed) {
+      return bIsSeed - aIsSeed;
+    }
+    const aPaperNum = a.metadata.IsAuthor ? a.metadata.PaperNum : -1;
+    const bPaperNum = b.metadata.IsAuthor ? b.metadata.PaperNum : -1;
+    if (bPaperNum !== aPaperNum) {
+      return bPaperNum - aPaperNum;
+    }
+    return a.index - b.index;
   };
 
   private computeGlobalLabelsPositions = (
@@ -1334,6 +1909,11 @@ export class AtlasViz {
       // Avoid rendering labels on top of each other
       const transformedWidth = textWidth * labelScale;
       const transformedHeight = LABEL_HEIGHT * labelScale;
+      const spacingFactor =
+        gridSquareSize >= 64 ? 1.2 :
+          gridSquareSize >= 32 ? 1.12 :
+            gridSquareSize >= 16 ? 1.08 : 1.04;
+      const spacingMargin = (spacingFactor - 1) / 2;
 
       // The origin of the label as at its center, so adjust x and y to put it in the top left corner
       const bounds = {
@@ -1343,10 +1923,10 @@ export class AtlasViz {
         height: transformedHeight,
       };
       // Grow bounds slightly to enforce a bit of space between the labels
-      bounds.x -= bounds.width * 0.1; //0.25
-      bounds.width *= 1.2; //1.5
-      bounds.y -= bounds.height * 0.1; //0.5
-      bounds.height *= 1.2; //2
+      bounds.x -= bounds.width * spacingMargin;
+      bounds.width *= spacingFactor;
+      bounds.y -= bounds.height * spacingMargin;
+      bounds.height *= spacingFactor;
 
       return bounds;
     };
@@ -1358,10 +1938,7 @@ export class AtlasViz {
     const labelsToRender = retainedLabels.map(({ datum }) => ({
       datum,
       transformedBounds: computeLabelTransformedBounds(
-        // Measuring text is expensive, so use an estimate max width.  In practice, this doesn't have
-        // that bad of an impact on the generated label positions.
-        // this.measureText(datum.metadata.title),
-        ESTIMATED_LABEL_MAX_WIDTH,
+        this.measureText(datum.metadata.FullName),
         datum.vector.x,
         datum.vector.y
       ),
@@ -1462,14 +2039,19 @@ export class AtlasViz {
     gridSquareArea.width = gridSquareSize;
     gridSquareArea.height = gridSquareSize;
 
+    const maxLabelsPerGridSquare = this.getAdaptiveMaxLabelsPerGridSquare(gridSquareSize);
+
     for (let y = 0; y < gridSquareCountY; y++) {
       for (let x = 0; x < gridSquareCountX; x++) {
         gridSquareArea.x = this.dataExtents.mins.x + x * gridSquareSize;
         gridSquareArea.y = this.dataExtents.mins.y + y * gridSquareSize;
         const visibleNodeIndices = this.computeVisibleNodeIndices(gridSquareArea);
+        const prioritizedNodeIndices = Array.from(visibleNodeIndices).sort((a, b) =>
+          this.compareDatumPriority(this.embedding[a], this.embedding[b])
+        );
 
         let score = 0;
-        for (const nodeIx of visibleNodeIndices) {
+        for (const nodeIx of prioritizedNodeIndices) {
           const datum = this.embedding[nodeIx];
           // if (String(datum.metadata.color_category) === '3') {
           //   console.log('[✅ CM4AI index]', datum.metadata.FullName);
@@ -1478,10 +2060,7 @@ export class AtlasViz {
           // adding the conditions, skip all the unselected categories
           if (!this.visibleCategories.has(String(datum.metadata.color_category))) continue;
 
-          // Measuring text is expensive, so use an estimate max width.  In practice, this doesn't have
-          // that bad of an impact on the generated label positions.
-          // const textWidth = this.measureText(datum.metadata.title);
-          const textWidth = ESTIMATED_LABEL_MAX_WIDTH;
+          const textWidth = this.measureText(datum.metadata.FullName);
           const bounds = computeLabelTransformedBounds(textWidth, datum.vector.x, datum.vector.y);
           if (checkIntersectsExistingLabel(bounds)) {
             continue;
@@ -1493,7 +2072,7 @@ export class AtlasViz {
           );
 
           score += 1;
-          if (score >= MAX_LABELS_PER_GRID_SQUARE) {
+          if (score >= maxLabelsPerGridSquare) {
             break;
           }
         }
@@ -1511,7 +2090,7 @@ export class AtlasViz {
     const text = datum.metadata.FullName ?? datum.metadata.FullName;
     const cachedTextSprite = this.cachedLabels.get(text);
     if (cachedTextSprite) {
-      this.setLabelScale(cachedTextSprite, datum, 1, labelScale);
+      this.setLabelScale(cachedTextSprite, datum, labelScale);
       return cachedTextSprite;
     }
 
@@ -1532,7 +2111,7 @@ export class AtlasViz {
 
     label.datum = datum;
     label.textWidth = textWidth;
-    this.setLabelScale(label, datum, 1, labelScale);
+    this.setLabelScale(label, datum, labelScale);
     this.cachedLabels.set(text, label);
     label.beginFill(0xff0000, 0.2);
     label.drawRect(-textWidth / 2, -LABEL_HEIGHT / 2, textWidth, LABEL_HEIGHT);
@@ -1561,6 +2140,12 @@ export class AtlasViz {
     // Remove but do not destroy the removed labels since we cache them
     this.labelsContainer.removeChildren() as NodeLabel[];
 
+    const labelBudgetMultiplier = this.localAvoidanceActive ? LABEL_BUDGET_MULTIPLIER_WHILE_AVOIDANCE : 1;
+    const labelBudget = Math.round(this.getAdaptiveLabelBudget(gridSquareSize) * labelBudgetMultiplier);
+    if (labelBudget <= 0) {
+      return;
+    }
+
     const globalLabelPositionsForZoomLevel = this.computeGlobalLabelsPositions(gridSquareSize);
 
     const visibleNodeIndices = new Set(this.computeVisibleNodeIndices(this.container.getVisibleBounds(), false));
@@ -1581,6 +2166,8 @@ export class AtlasViz {
         return isVisible && isAuthorValid && isCategorySelected;
       }
       ) // filter legend & range
+      .sort((a, b) => this.compareDatumPriority(a.datum, b.datum))
+      .slice(0, labelBudget)
       .map(({ datum }) => this.buildLabel(datum, labelScale));
 
     for (const label of labelsToRender) {
@@ -1599,6 +2186,15 @@ export class AtlasViz {
     this.container.off('pointerdown', this.pointerCbs.pointerUp);
     this.container.off('pointerup', this.pointerCbs.pointerUp);
     this.app.renderer.view.removeEventListener('pointermove', this.pointerCbs.pointerMove);
+    this.app.renderer.view.removeEventListener('pointerleave', this.pointerCbs.pointerLeave);
+    if (this.localAvoidanceTimeout !== null) {
+      window.clearTimeout(this.localAvoidanceTimeout);
+      this.localAvoidanceTimeout = null;
+    }
+    if (this.labelUpdateTimeout !== null) {
+      window.clearTimeout(this.labelUpdateTimeout);
+      this.labelUpdateTimeout = null;
+    }
     this.app.ticker.stop();
     this.app.destroy(false, { children: true, texture: true, baseTexture: true });
   }

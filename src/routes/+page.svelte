@@ -14,45 +14,52 @@
   let neighbors: any = null;
   let collaboratorsdict: any = {}; // Empty initially, loaded on-demand
   let error: string | null = null;
-  let backgroundSyncing = false;
-  let backgroundSyncProgress = 0;
-  let atlasRenderKey = 0;
-  const INITIAL_RENDER_LIMIT = 2000;
 
-  // Smooth progress animation during long operations
-  let progressInterval: ReturnType<typeof setInterval> | null = null;
-  
-  
-  const simulateProgress = (start: number, end: number, duration: number) => {
-    const startTime = Date.now();
-    const range = end - start;
-    
-    if (progressInterval) clearInterval(progressInterval);
-    
-    progressInterval = setInterval(() => {
-      const elapsed = Date.now() - startTime;
-      const progress = Math.min(elapsed / duration, 1);
-      
-      // Ease-out function for smooth deceleration
-      const eased = 1 - Math.pow(1 - progress, 3);
-      loadingProgress = start + (range * eased);
-      
-      if (progress >= 1) {
-        loadingProgress = end;
-        if (progressInterval) clearInterval(progressInterval);
-      }
-    }, 50);
-  };
-
-  const fetchPage = async (page: number, limit: number) => {
-    const url = `/api/data?page=${page}&limit=${limit}`;
+  const fetchFullGraph = async (onProgress: (progress: number) => void) => {
+    const url = '/api/data?page=0&limit=999999';
     const r = await fetch(url);
     if (!r.ok) {
       const t = await r.text();
       console.error('[ERROR] +page.svelte - Page fetch failed:', r.status, r.statusText, t);
-      throw new Error(`Paginated fetch failed: ${r.status} ${r.statusText}`);
+      throw new Error(`Full graph fetch failed: ${r.status} ${r.statusText}`);
     }
-    return r.json();
+
+    if (!r.body) {
+      return r.json();
+    }
+
+    const contentLengthHeader = r.headers.get('content-length');
+    const approxBytesHeader = r.headers.get('x-approx-bytes');
+    const totalBytesFromContentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+    const totalBytesFromApprox = approxBytesHeader ? Number(approxBytesHeader) : NaN;
+    const totalBytes = Number.isFinite(totalBytesFromContentLength) && totalBytesFromContentLength > 0
+      ? totalBytesFromContentLength
+      : (Number.isFinite(totalBytesFromApprox) && totalBytesFromApprox > 0 ? totalBytesFromApprox : NaN);
+
+    const reader = r.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let receivedBytes = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      chunks.push(value);
+      receivedBytes += value.length;
+      if (Number.isFinite(totalBytes) && totalBytes > 0) {
+        onProgress(Math.min(99, Math.floor((receivedBytes / totalBytes) * 100)));
+      }
+    }
+
+    const merged = new Uint8Array(receivedBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    const decoded = new TextDecoder().decode(merged);
+    return JSON.parse(decoded);
   };
 
   onMount(async () => {
@@ -62,17 +69,14 @@
       console.log('[DEBUG] +page.svelte - EmbeddingName from data:', data?.embeddingName);
       console.time('[timing] client fetch data');
       
-      // Initial connection
-      loadingProgress = 5;
-      simulateProgress(5, 25, 2000); // Simulate progress while connecting
-      
-      if (progressInterval) clearInterval(progressInterval);
-      loadingProgress = 30;
+      loadingProgress = 0;
 
-      // First payload: keep it small so the page becomes interactive quickly.
-      const firstPage = await fetchPage(0, INITIAL_RENDER_LIMIT);
-      embedding = Array.isArray(firstPage.embedding) ? firstPage.embedding : [];
-      neighbors = Array.isArray(firstPage.neighbors) ? firstPage.neighbors : [];
+      // Load full graph in one request for a consistent first render.
+      const fullGraph = await fetchFullGraph((progress) => {
+        loadingProgress = progress;
+      });
+      embedding = Array.isArray(fullGraph.embedding) ? fullGraph.embedding : [];
+      neighbors = Array.isArray(fullGraph.neighbors) ? fullGraph.neighbors : [];
       // Collaborators are loaded on-demand per author.
       
       loadingProgress = 100;
@@ -84,28 +88,6 @@
         neighborsItems: neighbors.length
       });
       console.log('[timing] Collaborators will be loaded on-demand when authors are selected');
-
-      // Continue loading remaining pages in background.
-      const total = firstPage?.pagination?.total ?? embedding.length;
-      let hasMore = !!firstPage?.pagination?.hasMore;
-      let page = 1;
-      if (hasMore && total > embedding.length) {
-        backgroundSyncing = true;
-        const allEmbedding = [...embedding];
-        const allNeighbors = [...neighbors];
-        while (hasMore) {
-          const part = await fetchPage(page, INITIAL_RENDER_LIMIT);
-          if (Array.isArray(part.embedding)) allEmbedding.push(...part.embedding);
-          if (Array.isArray(part.neighbors)) allNeighbors.push(...part.neighbors);
-          hasMore = !!part?.pagination?.hasMore;
-          page += 1;
-          backgroundSyncProgress = Math.min(100, Math.round((allEmbedding.length / total) * 100));
-        }
-        embedding = allEmbedding;
-        neighbors = allNeighbors;
-        atlasRenderKey += 1;
-        backgroundSyncing = false;
-      }
     } catch (e) {
       console.error('[ERROR] +page.svelte - Failed to load data:', e);
       console.error('[ERROR] +page.svelte - Error type:', typeof e);
@@ -122,7 +104,6 @@
       }
       
       loading = false;
-      if (progressInterval) clearInterval(progressInterval);
     }
   });
 </script>
@@ -137,8 +118,8 @@
       </div>
       <p class="progress-text">{Math.round(loadingProgress)}%</p>
       <p class="status-text">{
-        loadingProgress < 30 ? 'Connecting to server...' :
-        loadingProgress < 90 ? 'Loading graph data in batches...' :
+        loadingProgress < 5 ? 'Connecting to server...' :
+        loadingProgress < 90 ? 'Downloading full graph data...' :
         'Almost ready...'
       }</p>
     </div>
@@ -150,19 +131,12 @@
     <button on:click={() => window.location.reload()}>Retry</button>
   </div>
 {:else if embedding && neighbors && collaboratorsdict}
-  {#key atlasRenderKey}
-    <Atlas 
-      {embedding} 
-      embeddingName={data.embeddingName} 
-      embeddingNeighbors={neighbors} 
-      {collaboratorsdict} 
-    />
-  {/key}
-  {#if backgroundSyncing}
-    <div class="background-sync">
-      Optimizing in background: loading full graph ({backgroundSyncProgress}%)
-    </div>
-  {/if}
+  <Atlas 
+    {embedding} 
+    embeddingName={data.embeddingName} 
+    embeddingNeighbors={neighbors} 
+    {collaboratorsdict} 
+  />
 {/if}
 
 <style>
@@ -271,20 +245,4 @@
     transform: translateY(0);
   }
 
-  .background-sync {
-    position: fixed;
-    left: 50%;
-    bottom: 16px;
-    transform: translateX(-50%);
-    z-index: 80;
-    font-size: 13px;
-    font-weight: 600;
-    color: #0f172a;
-    background: rgba(255, 255, 255, 0.92);
-    border: 1px solid rgba(15, 23, 42, 0.12);
-    border-radius: 999px;
-    padding: 8px 14px;
-    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.14);
-    backdrop-filter: blur(6px);
-  }
 </style>
